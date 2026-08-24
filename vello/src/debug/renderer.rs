@@ -224,7 +224,7 @@ impl DebugRenderer {
         let (unpaired_pts_len, unpaired_pts_buf) = if layers.contains(DebugLayers::VALIDATION) {
             // TODO: have this write directly to a GPU buffer?
             let unpaired_pts: Vec<LineEndpoint> =
-                validate_line_soup(bytemuck::cast_slice(&downloads.lines.get_mapped_range()));
+                validate_line_soup(bytemuck::cast_slice(&downloads.lines.get_mapped_range().unwrap()));
             if unpaired_pts.is_empty() {
                 (0, None)
             } else {

@@ -36,6 +36,7 @@ mod draw;
 mod encoding;
 #[cfg(feature = "bump_estimate")]
 mod estimate;
+mod glass;
 mod glyph;
 mod glyph_cache;
 mod image_cache;
@@ -57,6 +58,10 @@ pub use draw::{
     DrawImage, DrawLinearGradient, DrawMonoid, DrawRadialGradient, DrawSweepGradient, DrawTag,
 };
 pub use encoding::{Encoding, Resources, StreamOffsets};
+pub use glass::{
+    GlassMarker, GlassMarkers, GlassSkip, IRect, MAX_GLASS_LAYERS, MAX_GLASS_PHASES, assign_phases,
+    pack_shelves,
+};
 pub use glyph::{FontEmbolden, Glyph, GlyphRun};
 pub use mask::{make_mask_lut, make_mask_lut_16};
 pub use math::Transform;

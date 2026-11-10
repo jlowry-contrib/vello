@@ -9,3 +9,4 @@ assets/downloads/*
 !assets/downloads/.tracked
 research/examples/headless/outputs/*
 !research/examples/headless/outputs/.tracked
+research/vello_research_tests/target/

@@ -23,7 +23,8 @@ use skrifa::{
 #[cfg(feature = "bump_estimate")]
 use vello_encoding::BumpAllocatorMemory;
 use vello_encoding::{
-    DrawBeginClip, Encoding, FontEmbolden, Glyph, GlyphRun, NormalizedCoord, Patch, Transform,
+    DrawBeginClip, Encoding, FontEmbolden, GlassMarker, GlassSkip, Glyph, GlyphRun,
+    MAX_GLASS_LAYERS, NormalizedCoord, Patch, Transform,
 };
 
 // TODO - Document invariants and edge cases (#470)
@@ -437,13 +438,51 @@ impl Scene {
         DrawGlyphs::new(self, font)
     }
 
+    /// Marks a point in paint order where glass reads its backdrop and composites.
+    ///
+    /// The region and composite are in device pixels and are snapped outward to
+    /// 16 px tiles. An empty marker is skipped; a marker under more than
+    /// [`MAX_GLASS_LAYERS`] open layers is skipped and logged.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the composite does not lie inside the region.
+    pub fn push_glass(&mut self, marker: GlassMarker) {
+        match self.encoding.encode_glass(&marker) {
+            Ok(()) | Err(GlassSkip::Empty) => {}
+            Err(GlassSkip::TooDeep) => log::warn!(
+                "glass.layers.too_deep id={} depth={} max={}",
+                marker.id,
+                self.encoding.n_open_clips,
+                MAX_GLASS_LAYERS
+            ),
+        }
+    }
+
     /// Appends a child scene.
     ///
     /// The given transform is applied to every transform in the child.
     /// This is an O(N) operation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the child has glass markers and `transform` is not an integer translation.
     pub fn append(&mut self, other: &Self, transform: Option<Affine>) {
         let t = transform.as_ref().map(Transform::from_kurbo);
+        let first_marker = self.encoding.glass.len();
         self.encoding.append(&other.encoding, &t);
+        let glass = &self.encoding.glass;
+        for (marker, &depth) in glass.markers[first_marker..]
+            .iter()
+            .zip(&glass.depths[first_marker..])
+        {
+            if depth > MAX_GLASS_LAYERS {
+                log::warn!(
+                    "glass.layers.too_deep id={} depth={depth} max={MAX_GLASS_LAYERS}",
+                    marker.id
+                );
+            }
+        }
         #[cfg(feature = "bump_estimate")]
         self.estimator.append(&other.estimator, t.as_ref());
     }

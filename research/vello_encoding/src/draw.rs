@@ -41,6 +41,9 @@ impl DrawTag {
 
     /// End layer/clip.
     pub const END_CLIP: Self = Self(0x21);
+
+    /// Glass marker.
+    pub const GLASS: Self = Self(0x4C); // info: 1, scene: 3 (index, composite tile min, max)
 }
 
 impl DrawTag {

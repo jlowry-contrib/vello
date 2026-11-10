@@ -109,6 +109,7 @@
 )]
 
 mod debug;
+pub mod glass;
 mod recording;
 mod render;
 mod scene;

@@ -151,6 +151,22 @@ pub struct ConfigUniform {
     pub blend_size: u32,
     /// Size of per-tile command list buffer allocation (in `u32`s).
     pub ptcl_size: u32,
+    /// Number of glass markers in the scene.
+    pub glass_markers: u32,
+    /// Number of glass phases; 0 renders without glass commands.
+    pub glass_phases: u32,
+    /// Format of the saved fine state at a glass stop.
+    pub glass_resume_color: u32,
+    /// Glass control flags; bit 0 skips every stop (a test control).
+    pub glass_flags: u32,
+    /// Capacity of the phase 1 resume buffer, in stops.
+    pub glass_capacity_1: u32,
+    /// Capacity of the phase 2 resume buffer, in stops.
+    pub glass_capacity_2: u32,
+    /// Capacity of the phase 3 resume buffer, in stops.
+    pub glass_capacity_3: u32,
+    /// Capacity of the phase 4 resume buffer, in stops.
+    pub glass_capacity_4: u32,
 }
 
 /// CPU side setup and configuration.
@@ -189,6 +205,7 @@ impl RenderConfig {
                 blend_size: buffer_sizes.blend_spill.len(),
                 ptcl_size: buffer_sizes.ptcl.len(),
                 layout: *layout,
+                ..Default::default()
             },
             workgroup_counts,
             buffer_sizes,

@@ -44,6 +44,7 @@ use vello::wgpu::{
 use vello::{AaConfig, RendererOptions, Scene, util::RenderContext, util::block_on_wgpu};
 
 mod compare;
+pub mod glass;
 mod snapshot;
 
 pub use compare::{GpuCpuComparison, compare_gpu_cpu, compare_gpu_cpu_sync};

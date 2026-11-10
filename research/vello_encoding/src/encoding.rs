@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 use crate::DrawBeginClip;
+use crate::glass::{GlassMarker, GlassMarkers, GlassSkip, MAX_GLASS_LAYERS, composite_tile_words};
 
 use super::{
     DrawBlurRoundedRect, DrawColor, DrawImage, DrawLinearGradient, DrawRadialGradient,
@@ -50,6 +51,8 @@ pub struct Encoding {
     pub n_open_clips: u32,
     /// Flags that capture the current state of the encoding.
     pub flags: u32,
+    /// Glass markers, in paint order.
+    pub glass: GlassMarkers,
 }
 
 impl Encoding {
@@ -88,10 +91,17 @@ impl Encoding {
         self.n_open_clips = 0;
         self.flags = 0;
         self.resources.reset();
+        self.glass.clear();
     }
 
     /// Appends another encoding to this one with an optional transform.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `other` has glass markers and `transform` is not an integer translation.
     pub fn append(&mut self, other: &Self, transform: &Option<Transform>) {
+        let draw_data_base = self.draw_data.len();
+        let depth_base = self.n_open_clips;
         let glyph_runs_base = {
             let offsets = self.stream_offsets();
             let stops_base = self.resources.color_stops.len();
@@ -156,6 +166,13 @@ impl Encoding {
         self.path_data.extend_from_slice(&other.path_data);
         self.draw_tags.extend_from_slice(&other.draw_tags);
         self.draw_data.extend_from_slice(&other.draw_data);
+        self.glass.append(
+            &other.glass,
+            &mut self.draw_data,
+            draw_data_base,
+            depth_base,
+            transform.as_ref(),
+        );
         self.n_paths += other.n_paths;
         self.n_path_segments += other.n_path_segments;
         self.n_clips += other.n_clips;
@@ -497,6 +514,48 @@ impl Encoding {
             self.n_clips += 1;
             self.n_open_clips -= 1;
         }
+    }
+
+    /// Encodes a glass marker: its tile-snapped region as a path, then a `GLASS` draw object.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GlassSkip::Empty`] if the region or composite is empty, and
+    /// [`GlassSkip::TooDeep`] if more than [`MAX_GLASS_LAYERS`] layers are open.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the composite does not lie inside the region.
+    pub fn encode_glass(&mut self, marker: &GlassMarker) -> Result<(), GlassSkip> {
+        if marker.region.is_empty() || marker.composite.is_empty() {
+            return Err(GlassSkip::Empty);
+        }
+        if self.n_open_clips > MAX_GLASS_LAYERS {
+            return Err(GlassSkip::TooDeep);
+        }
+        assert!(
+            marker.region.contains(marker.composite),
+            "glass marker composite must lie inside its region: {marker:?}"
+        );
+        let marker = marker.snap();
+        let region = marker.region;
+        self.encode_transform(Transform::IDENTITY);
+        self.encode_fill_style(Fill::NonZero);
+        let rect = peniko::kurbo::Rect::new(
+            region.x0.into(),
+            region.y0.into(),
+            region.x1.into(),
+            region.y1.into(),
+        );
+        let encoded = self.encode_shape(&rect, true);
+        debug_assert!(encoded, "a non-empty glass region always encodes segments");
+        let offset = self.draw_data.len();
+        let [min, max] = composite_tile_words(marker.composite);
+        self.draw_tags.push(DrawTag::GLASS);
+        self.draw_data
+            .extend_from_slice(&[self.glass.len() as u32, min, max]);
+        self.glass.push(marker, offset, self.n_open_clips);
+        Ok(())
     }
 
     /// Forces the next transform and style to be encoded even if they match

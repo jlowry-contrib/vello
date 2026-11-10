@@ -25,6 +25,8 @@ const DRAWTAG_FILL_IMAGE = 0x28Cu;
 const DRAWTAG_BLURRED_ROUNDED_RECT = 0x2d4u;
 const DRAWTAG_BEGIN_CLIP = 0x49u;
 const DRAWTAG_END_CLIP = 0x21u;
+// Glass marker: scene words are the marker index and the composite's tile min and max.
+const DRAWTAG_GLASS = 0x4Cu;
 
 /// The first word of each draw info stream entry contains the flags. This is not a part of the
 /// draw object stream but get used after the draw objects have been reduced on the GPU.

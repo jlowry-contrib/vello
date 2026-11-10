@@ -39,6 +39,18 @@ struct Config {
     segments_size: u32,
     blend_size: u32,
     ptcl_size: u32,
+
+    // Glass markers and phases; glass_phases == 0 renders without glass commands.
+    glass_markers: u32,
+    glass_phases: u32,
+    glass_resume_color: u32,
+    // Bit 0 skips every glass stop (a test control).
+    glass_flags: u32,
+    // Resume buffer capacity of each phase, in stops.
+    glass_capacity_1: u32,
+    glass_capacity_2: u32,
+    glass_capacity_3: u32,
+    glass_capacity_4: u32,
 }
 
 // Geometry of tiles and bins

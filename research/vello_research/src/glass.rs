@@ -58,6 +58,10 @@ pub struct GlassFrame<'a> {
 }
 
 /// One phase's resources, handed to [`GlassPasses::record`].
+///
+/// The atlases persist across frames, so a backdrop slot's pixels outside the marker's
+/// region intersected with its clip are undefined, as are glass slot pixels the passes
+/// don't write.
 #[cfg(feature = "wgpu")]
 #[derive(Copy, Clone, Debug)]
 pub struct GlassPhase<'a> {

@@ -102,20 +102,85 @@ struct GlassMarker {
     pad: u32,
 }
 
+#ifndef resume
 // The phase this permutation runs; snapshots and stops are for later phases only.
 const GLASS_RUNNING_PHASE = 0u;
+#endif
+
+// `glass_state` layout, in words; mirrors `glass_state_size` in `vello`'s `render.rs`.
+// [0] the running phase, which `glass_resume_setup` increments before each resume dispatch.
+const GLASS_STATE_PHASE = 0u;
+// [4 + j - 1] the stop count of phase j; [1..4) is padding.
+const GLASS_STATE_STOPS = 4u;
+// [8..) the tile lists of phases 1..4, then their resume records.
+const GLASS_STATE_TILES = 8u;
+// Resume record header: COMPOSITE command index, clip depth, tile index, marker.
+const GLASS_RECORD_HEADER = 4u;
+// Colour words per stopped tile: four `f32` or two packed `unorm16` pairs per pixel.
+const GLASS_COLOR_WORDS_F32 = 1024u;
+const GLASS_COLOR_WORDS_UNORM16 = 512u;
+// Register-held blend stack words: BLEND_STACK_SPLIT levels of 256 pixels.
+const GLASS_STACK_WORDS = 1024u;
+// `config.glass_flags` bit 0 skips every stop (the split tests' control).
+const GLASS_STOPS_DISABLED = 1u;
 
 @group(0) @binding(GLASS_MARKERS_INDEX)
 var<storage> glass_markers: array<GlassMarker>;
 
 @group(0) @binding(GLASS_STATE_INDEX)
-var<storage, read_write> glass_state: array<u32>;
+var<storage, read_write> glass_state: array<atomic<u32>>;
 
 @group(0) @binding(GLASS_BACKDROP_INDEX)
 var glass_backdrop: texture_storage_2d<rgba8unorm, write>;
 
 @group(0) @binding(GLASS_ATLAS_INDEX)
 var glass_atlas: texture_2d<f32>;
+
+// The stop slot thread 0 claims, shared with the workgroup.
+var<workgroup> glass_slot: u32;
+#ifdef resume
+// Thread 0's reads for a resumed tile: phase, command index, clip depth and tile index.
+var<workgroup> glass_resume: vec4<u32>;
+#endif
+
+// Returns the most tiles that can stop for phase `j`, from 1.
+fn glass_capacity(j: u32) -> u32 {
+    switch j {
+        case 1u: { return config.glass_capacity_1; }
+        case 2u: { return config.glass_capacity_2; }
+        case 3u: { return config.glass_capacity_3; }
+        case 4u: { return config.glass_capacity_4; }
+        default: { return 0u; }
+    }
+}
+
+// Returns the total capacity of the phases before phase `j`.
+fn glass_capacity_before(j: u32) -> u32 {
+    var total = 0u;
+    for (var i = 1u; i < j; i += 1u) {
+        total += glass_capacity(i);
+    }
+    return total;
+}
+
+fn glass_color_words() -> u32 {
+    return select(GLASS_COLOR_WORDS_F32, GLASS_COLOR_WORDS_UNORM16, config.glass_resume_color == 1u);
+}
+
+fn glass_record_words() -> u32 {
+    return GLASS_RECORD_HEADER + glass_color_words() + GLASS_STACK_WORDS;
+}
+
+// Returns the first word of phase `j`'s tile list.
+fn glass_tiles_base(j: u32) -> u32 {
+    return GLASS_STATE_TILES + glass_capacity_before(j);
+}
+
+// Returns the first word of resume record `slot` of phase `j`.
+fn glass_record_base(j: u32, slot: u32) -> u32 {
+    let records = GLASS_STATE_TILES + glass_capacity_before(5u);
+    return records + (glass_capacity_before(j) + slot) * glass_record_words();
+}
 #endif
 
 #ifdef msaa
@@ -1135,8 +1200,33 @@ fn main(
         // We use ptcl[0] for this so we don't use up a binding for bump.
         return;
     }
+#ifdef resume
+    // One workgroup per tile stopped for the running phase, in the order they stopped.
+    if local_id.x == 0u && local_id.y == 0u {
+        let phase = atomicLoad(&glass_state[GLASS_STATE_PHASE]);
+        let tile = atomicLoad(&glass_state[glass_tiles_base(phase) + wg_id.x]);
+        let record = glass_record_base(phase, wg_id.x);
+        let resume_ix = atomicLoad(&glass_state[record]);
+        let depth = atomicLoad(&glass_state[record + 1u]);
+        glass_resume = vec4(phase, resume_ix, depth, tile);
+    }
+    let resume = workgroupUniformLoad(&glass_resume);
+    let running_phase = resume.x;
+    if wg_id.x >= glass_capacity(running_phase) {
+        // Only a planning bug overfills a phase; its stops beyond capacity saved nothing.
+        return;
+    }
+    let tile_ix = resume.w;
+    let tile_xy = vec2(tile_ix % config.width_in_tiles, tile_ix / config.width_in_tiles);
+    let pixel_xy = tile_xy * vec2(TILE_WIDTH, TILE_HEIGHT) + vec2(local_id.x * PIXELS_PER_THREAD, local_id.y);
+    let xy = vec2<f32>(pixel_xy);
+#else
+#ifdef glass
+    let running_phase = GLASS_RUNNING_PHASE;
+#endif
     let tile_ix = wg_id.y * config.width_in_tiles + wg_id.x;
     let xy = vec2(f32(global_id.x * PIXELS_PER_THREAD), f32(global_id.y));
+#endif
     let local_xy = vec2(f32(local_id.x * PIXELS_PER_THREAD), f32(local_id.y));
     var rgba: array<vec4<f32>, PIXELS_PER_THREAD>;
     let base_color = unpack4x8unorm(config.base_color);
@@ -1153,6 +1243,31 @@ fn main(
     var cmd_ix = tile_ix * PTCL_INITIAL_ALLOC;
     let blend_offset = ptcl[cmd_ix];
     cmd_ix += 1u;
+#ifdef resume
+    // Restore the state the tile saved at its stop; levels from BLEND_STACK_SPLIT up stay in
+    // `blend_spill`.
+    cmd_ix = resume.y;
+    clip_depth = resume.z;
+    let record = glass_record_base(running_phase, wg_id.x);
+    let colors = record + GLASS_RECORD_HEADER;
+    let stack = colors + glass_color_words();
+    let first_pixel = local_id.x * PIXELS_PER_THREAD + local_id.y * TILE_WIDTH;
+    for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
+        let p = first_pixel + i;
+        if config.glass_resume_color == 1u {
+            let rg = unpack2x16unorm(atomicLoad(&glass_state[colors + 2u * p]));
+            let ba = unpack2x16unorm(atomicLoad(&glass_state[colors + 2u * p + 1u]));
+            rgba[i] = vec4(rg, ba);
+        } else {
+            for (var c = 0u; c < 4u; c += 1u) {
+                rgba[i][c] = bitcast<f32>(atomicLoad(&glass_state[colors + 4u * p + c]));
+            }
+        }
+        for (var level = 0u; level < min(clip_depth, BLEND_STACK_SPLIT); level += 1u) {
+            blend_stack[level][i] = atomicLoad(&glass_state[stack + TILE_WIDTH * TILE_HEIGHT * level + p]);
+        }
+    }
+#endif
     // main interpretation loop
     while true {
         let tag = ptcl[cmd_ix];
@@ -1245,7 +1360,7 @@ fn main(
             }
             case CMD_GLASS_SNAPSHOT: {
                 let marker = glass_markers[ptcl[cmd_ix + 1u]];
-                if marker.phase > GLASS_RUNNING_PHASE {
+                if marker.phase > running_phase {
                     let tile_size = vec2(TILE_WIDTH, TILE_HEIGHT);
                     let region_min = marker.region.xy * tile_size;
                     // A tile can reach past the target's right or bottom edge.
@@ -1262,8 +1377,66 @@ fn main(
                 }
                 cmd_ix += 2u;
             }
-            case CMD_GLASS_STOP, CMD_GLASS_COMPOSITE: {
-                // Phase 0 neither stops nor composites yet.
+            case CMD_GLASS_STOP: {
+                // Stops the tile for a later phase's glass: saves the state and leaves the
+                // output to the dispatch that resumes it.
+                let marker_ix = ptcl[cmd_ix + 1u];
+                let phase = glass_markers[marker_ix].phase;
+                if (config.glass_flags & GLASS_STOPS_DISABLED) == 0u && phase > running_phase {
+                    if local_id.x == 0u && local_id.y == 0u {
+                        glass_slot = atomicAdd(&glass_state[GLASS_STATE_STOPS + phase - 1u], 1u);
+                    }
+                    let slot = workgroupUniformLoad(&glass_slot);
+                    // The capacity counts every composite tile of the phase, so this always
+                    // holds; the check keeps a planning bug from writing past the records.
+                    if slot < glass_capacity(phase) {
+                        let record = glass_record_base(phase, slot);
+                        if local_id.x == 0u && local_id.y == 0u {
+                            atomicStore(&glass_state[glass_tiles_base(phase) + slot], tile_ix);
+                            atomicStore(&glass_state[record], cmd_ix + 2u);
+                            atomicStore(&glass_state[record + 1u], clip_depth);
+                            atomicStore(&glass_state[record + 2u], tile_ix);
+                            atomicStore(&glass_state[record + 3u], marker_ix);
+                        }
+                        let colors = record + GLASS_RECORD_HEADER;
+                        let stack = colors + glass_color_words();
+                        let first_pixel = local_id.x * PIXELS_PER_THREAD + local_id.y * TILE_WIDTH;
+                        for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
+                            let p = first_pixel + i;
+                            if config.glass_resume_color == 1u {
+                                atomicStore(&glass_state[colors + 2u * p], pack2x16unorm(rgba[i].xy));
+                                atomicStore(&glass_state[colors + 2u * p + 1u], pack2x16unorm(rgba[i].zw));
+                            } else {
+                                for (var c = 0u; c < 4u; c += 1u) {
+                                    atomicStore(&glass_state[colors + 4u * p + c], bitcast<u32>(rgba[i][c]));
+                                }
+                            }
+                            for (var level = 0u; level < min(clip_depth, BLEND_STACK_SPLIT); level += 1u) {
+                                atomicStore(&glass_state[stack + TILE_WIDTH * TILE_HEIGHT * level + p], blend_stack[level][i]);
+                            }
+                        }
+                    }
+                    return;
+                }
+                cmd_ix += 2u;
+            }
+            case CMD_GLASS_COMPOSITE: {
+                // Source-over of the phase's glass into the current layer.
+                let marker = glass_markers[ptcl[cmd_ix + 1u]];
+                if marker.phase != 0u && marker.phase <= running_phase {
+                    let tile_size = vec2(TILE_WIDTH, TILE_HEIGHT);
+                    let composite_min = marker.composite.xy * tile_size;
+                    let composite_max = marker.composite.zw * tile_size;
+                    let origin = vec2(marker.glass_origin & 0xffffu, marker.glass_origin >> 16u);
+                    let xy_uint = vec2<u32>(xy);
+                    for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
+                        let coords = xy_uint + vec2(i, 0u);
+                        if all(coords >= composite_min) && all(coords < composite_max) {
+                            let glass = textureLoad(glass_atlas, vec2<i32>(origin + coords - composite_min), 0);
+                            rgba[i] = glass + (1.0 - glass.a) * rgba[i];
+                        }
+                    }
+                }
                 cmd_ix += 2u;
             }
 #endif

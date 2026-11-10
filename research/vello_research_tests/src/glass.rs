@@ -162,7 +162,7 @@ pub fn max_delta(a: &[u8], b: &[u8]) -> u8 {
 /// Renders `scene` on opaque white with the stock path and reads it back as RGBA8.
 pub fn render_scene(width: u32, height: u32, aa: AaConfig, scene: &Scene) -> Vec<u8> {
     let (device, queue) = &*WGPU_DEVICE_QUEUE;
-    let mut renderer = renderer(aa);
+    let mut renderer = renderer(aa, false);
     let target = target(device, width, height);
     let view = target.create_view(&wgpu::TextureViewDescriptor::default());
     renderer
@@ -173,19 +173,43 @@ pub fn render_scene(width: u32, height: u32, aa: AaConfig, scene: &Scene) -> Vec
 
 /// Renders `build`'s scene unsplit without markers, then split with markers.
 ///
-/// `build` receives whether to push the glass markers. Both renders are on opaque white,
-/// read back as RGBA8.
+/// `build` receives whether to push the glass markers, and `configure` sets up the renderer
+/// first. Both renders are on opaque white, read back as RGBA8.
 pub fn render_pair(
     width: u32,
     height: u32,
     aa: AaConfig,
     resume: GlassResumeFormat,
+    configure: impl Fn(&mut Renderer),
+    build: impl Fn(&mut Scene, bool),
+    passes: &mut dyn GlassPasses,
+) -> (Vec<u8>, Vec<u8>) {
+    let mut renderer = renderer(aa, false);
+    renderer.set_glass_resume_format(resume);
+    configure(&mut renderer);
+    pair(&mut renderer, width, height, aa, build, passes)
+}
+
+/// Renders as [`render_pair`] does, with the CPU stages and the default settings.
+pub fn render_pair_cpu(
+    width: u32,
+    height: u32,
+    build: impl Fn(&mut Scene, bool),
+    passes: &mut dyn GlassPasses,
+) -> (Vec<u8>, Vec<u8>) {
+    let mut renderer = renderer(AaConfig::Area, true);
+    pair(&mut renderer, width, height, AaConfig::Area, build, passes)
+}
+
+fn pair(
+    renderer: &mut Renderer,
+    width: u32,
+    height: u32,
+    aa: AaConfig,
     build: impl Fn(&mut Scene, bool),
     passes: &mut dyn GlassPasses,
 ) -> (Vec<u8>, Vec<u8>) {
     let (device, queue) = &*WGPU_DEVICE_QUEUE;
-    let mut renderer = renderer(aa);
-    renderer.set_glass_resume_format(resume);
     let params = params(width, height, aa);
     let [unsplit, split] = [false, true].map(|marked| {
         let mut scene = Scene::new();
@@ -206,12 +230,12 @@ pub fn render_pair(
     (unsplit, split)
 }
 
-fn renderer(aa: AaConfig) -> Renderer {
+fn renderer(aa: AaConfig, use_cpu: bool) -> Renderer {
     let (device, _) = &*WGPU_DEVICE_QUEUE;
     Renderer::new(
         device,
         RendererOptions {
-            use_cpu: false,
+            use_cpu,
             num_init_threads: NonZeroUsize::new(1),
             antialiasing_support: std::iter::once(aa).collect(),
             pipeline_cache: None,

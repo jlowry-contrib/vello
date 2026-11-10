@@ -8,3 +8,6 @@ fine
 + fine_area_glass: glass
 + fine_msaa8_glass: msaa msaa8 glass
 + fine_msaa16_glass: msaa msaa16 glass
++ fine_area_resume: glass resume
++ fine_msaa8_resume: msaa msaa8 glass resume
++ fine_msaa16_resume: msaa msaa16 glass resume

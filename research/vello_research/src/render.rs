@@ -9,7 +9,7 @@ use crate::{AaConfig, RenderParams};
 
 #[cfg(feature = "wgpu")]
 use crate::Scene;
-use crate::glass::GlassMarkerRow;
+use crate::glass::{GlassMarkerRow, MAX_GLASS_PHASES};
 
 use vello_encoding::{Encoding, Resolver, WorkgroupSize, make_mask_lut, make_mask_lut_16};
 
@@ -92,8 +92,32 @@ pub(crate) fn render_full(
     render_encoding_full(scene.encoding(), resolver, shaders, image_atlas, params)
 }
 
-/// Size of the glass state's per-frame counters, which are zeroed each frame.
+/// Size of `glass_state`'s header, which is zeroed each frame: the running phase, three
+/// padding words and the stop count of each of the four phases, as `u32`s.
 const GLASS_STATE_HEADER_SIZE: u64 = 32;
+
+/// Words in a resume record's header: command index, clip depth, tile index and marker.
+const GLASS_RECORD_HEADER_WORDS: u64 = 4;
+
+/// Words of a stopped tile's colour: 256 pixels of four `f32`, or of two packed `unorm16` pairs.
+const GLASS_COLOR_WORDS: [u64; 2] = [1024, 512];
+
+/// Words of a stopped tile's register blend stack: `BLEND_STACK_SPLIT` (4) levels of 256 pixels.
+const GLASS_STACK_WORDS: u64 = 1024;
+
+/// Bytes of one phase's indirect dispatch arguments: `(count_x, 1, 1, pad)`.
+const GLASS_ARGS_SIZE: u64 = 16;
+
+/// Returns the size in bytes of `glass_state` for the given phase capacities.
+///
+/// The layout, in `u32` words, mirrors `fine.wgsl`: the 8-word header, then each phase's
+/// tile list (`capacity` words), then each phase's resume records (`capacity` records).
+fn glass_state_size(capacities: [u32; 4], resume_color: u32) -> u64 {
+    let tiles: u64 = capacities.iter().map(|&c| u64::from(c)).sum();
+    let record =
+        GLASS_RECORD_HEADER_WORDS + GLASS_COLOR_WORDS[resume_color as usize] + GLASS_STACK_WORDS;
+    GLASS_STATE_HEADER_SIZE + 4 * tiles * (1 + record)
+}
 
 /// One frame's glass settings and resources.
 pub(crate) struct GlassRender<'a> {
@@ -636,6 +660,8 @@ impl Render {
     }
 
     /// Run fine rasterization, as glass phase 0 followed by the external phases if `glass` is set.
+    ///
+    /// Each external phase is followed by a dispatch that resumes the tiles stopped for it.
     fn record_fine_inner(
         &mut self,
         shaders: &FullShaders,
@@ -646,7 +672,10 @@ impl Render {
         let fine = self.fine_resources.take().unwrap();
         let glass_bufs = glass.map(|glass| {
             let markers = recording.upload("vello.glass_markers", bytemuck::cast_slice(glass.rows));
-            let state = BufferProxy::new(GLASS_STATE_HEADER_SIZE, "vello.glass_state");
+            let state = BufferProxy::new(
+                glass_state_size(glass.capacities, glass.resume_color),
+                "vello.glass_state",
+            );
             recording.push(Command::Clear(state, 0, Some(GLASS_STATE_HEADER_SIZE)));
             (markers, state)
         });
@@ -659,12 +688,13 @@ impl Render {
             ]
         });
         let glass_resources = glass_resources.iter().flatten().copied();
-        match fine.aa_config {
+        // The shader for phase 0 and, with glass, the shader that resumes stopped tiles.
+        let (fine_shader, resume_shader, resources) = match fine.aa_config {
             AaConfig::Area => {
-                let shader = if glass.is_some() {
-                    shaders.fine_area_glass
+                let (shader, resume) = if glass.is_some() {
+                    (shaders.fine_area_glass, shaders.fine_area_resume)
                 } else {
-                    shaders.fine_area
+                    (shaders.fine_area, None)
                 };
                 let resources = [
                     fine.config_buf,
@@ -676,11 +706,14 @@ impl Render {
                     fine.gradient_image,
                     fine.image_atlas,
                 ];
-                recording.dispatch(
+                (
                     shader.expect("shaders not configured to support AA mode: area"),
-                    fine_wg_count,
-                    resources.into_iter().chain(glass_resources),
-                );
+                    resume,
+                    resources
+                        .into_iter()
+                        .chain(glass_resources)
+                        .collect::<Vec<_>>(),
+                )
             }
             _ => {
                 if self.mask_buf.is_none() {
@@ -692,21 +725,21 @@ impl Render {
                     let buf = recording.upload("vello.mask_lut", mask_lut);
                     self.mask_buf = Some(buf.into());
                 }
-                let fine_shader = match (fine.aa_config, glass.is_some()) {
-                    (AaConfig::Msaa16, false) => shaders
-                        .fine_msaa16
-                        .expect("shaders not configured to support AA mode: msaa16"),
-                    (AaConfig::Msaa8, false) => shaders
-                        .fine_msaa8
-                        .expect("shaders not configured to support AA mode: msaa8"),
-                    (AaConfig::Msaa16, true) => shaders
-                        .fine_msaa16_glass
-                        .expect("shaders not configured to support AA mode: msaa16"),
-                    (AaConfig::Msaa8, true) => shaders
-                        .fine_msaa8_glass
-                        .expect("shaders not configured to support AA mode: msaa8"),
+                let (fine_shader, resume, mode) = match (fine.aa_config, glass.is_some()) {
+                    (AaConfig::Msaa16, false) => (shaders.fine_msaa16, None, "msaa16"),
+                    (AaConfig::Msaa8, false) => (shaders.fine_msaa8, None, "msaa8"),
+                    (AaConfig::Msaa16, true) => (
+                        shaders.fine_msaa16_glass,
+                        shaders.fine_msaa16_resume,
+                        "msaa16",
+                    ),
+                    (AaConfig::Msaa8, true) => {
+                        (shaders.fine_msaa8_glass, shaders.fine_msaa8_resume, "msaa8")
+                    }
                     _ => unreachable!(),
                 };
+                let fine_shader = fine_shader
+                    .unwrap_or_else(|| panic!("shaders not configured to support AA mode: {mode}"));
                 let resources = [
                     fine.config_buf,
                     fine.segments_buf,
@@ -718,17 +751,39 @@ impl Render {
                     fine.image_atlas,
                     self.mask_buf.unwrap(),
                 ];
-                recording.dispatch(
+                (
                     fine_shader,
-                    fine_wg_count,
-                    resources.into_iter().chain(glass_resources),
-                );
+                    resume,
+                    resources
+                        .into_iter()
+                        .chain(glass_resources)
+                        .collect::<Vec<_>>(),
+                )
             }
-        }
+        };
+        recording.dispatch(fine_shader, fine_wg_count, resources.iter().copied());
         if let Some((glass, (markers, state))) = glass.zip(glass_bufs) {
+            let resume_shader = resume_shader.expect("glass permutations come with resume ones");
+            // `(count_x, 1, 1, pad)` per phase, written by `glass_resume_setup`.
+            let args = BufferProxy::new(
+                u64::from(MAX_GLASS_PHASES) * GLASS_ARGS_SIZE,
+                "vello.glass_args",
+            );
             for phase in 1..=glass.phases {
                 recording.push(Command::External(phase));
+                recording.dispatch(
+                    shaders.glass_resume_setup,
+                    (1, 1, 1),
+                    [ResourceProxy::Buffer(state), ResourceProxy::Buffer(args)],
+                );
+                recording.dispatch_indirect(
+                    resume_shader,
+                    args,
+                    u64::from(phase - 1) * GLASS_ARGS_SIZE,
+                    resources.iter().copied(),
+                );
             }
+            recording.free_buffer(args);
             recording.free_buffer(markers);
             recording.free_buffer(state);
         }

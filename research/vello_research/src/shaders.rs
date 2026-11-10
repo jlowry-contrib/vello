@@ -42,6 +42,10 @@ pub struct FullShaders {
     pub fine_area_glass: Option<ShaderId>,
     pub fine_msaa8_glass: Option<ShaderId>,
     pub fine_msaa16_glass: Option<ShaderId>,
+    pub fine_area_resume: Option<ShaderId>,
+    pub fine_msaa8_resume: Option<ShaderId>,
+    pub fine_msaa16_resume: Option<ShaderId>,
+    pub glass_resume_setup: ShaderId,
     // 2-level dispatch works for CPU pathtag scan even for large
     // inputs, 3-level is not yet implemented.
     pub pathtag_is_cpu: bool,
@@ -232,7 +236,7 @@ pub(crate) fn full_shaders(
     let msaa_glass_resources = [&fine_resources[..], &glass_resources].concat();
 
     let aa_support = &options.antialiasing_support;
-    let (fine_area, fine_area_glass) = if aa_support.area {
+    let (fine_area, fine_area_glass, fine_area_resume) = if aa_support.area {
         (
             Some(add_shader!(
                 fine_area,
@@ -244,11 +248,16 @@ pub(crate) fn full_shaders(
                 area_glass_resources,
                 CpuShaderType::Missing
             )),
+            Some(add_shader!(
+                fine_area_resume,
+                area_glass_resources,
+                CpuShaderType::Missing
+            )),
         )
     } else {
-        (None, None)
+        (None, None, None)
     };
-    let (fine_msaa8, fine_msaa8_glass) = if aa_support.msaa8 {
+    let (fine_msaa8, fine_msaa8_glass, fine_msaa8_resume) = if aa_support.msaa8 {
         (
             Some(add_shader!(
                 fine_msaa8,
@@ -260,11 +269,16 @@ pub(crate) fn full_shaders(
                 msaa_glass_resources,
                 CpuShaderType::Missing
             )),
+            Some(add_shader!(
+                fine_msaa8_resume,
+                msaa_glass_resources,
+                CpuShaderType::Missing
+            )),
         )
     } else {
-        (None, None)
+        (None, None, None)
     };
-    let (fine_msaa16, fine_msaa16_glass) = if aa_support.msaa16 {
+    let (fine_msaa16, fine_msaa16_glass, fine_msaa16_resume) = if aa_support.msaa16 {
         (
             Some(add_shader!(
                 fine_msaa16,
@@ -276,10 +290,19 @@ pub(crate) fn full_shaders(
                 msaa_glass_resources,
                 CpuShaderType::Missing
             )),
+            Some(add_shader!(
+                fine_msaa16_resume,
+                msaa_glass_resources,
+                CpuShaderType::Missing
+            )),
         )
     } else {
-        (None, None)
+        (None, None, None)
     };
+
+    // Glass needs the GPU stages, so the setup has no CPU mirror.
+    let glass_resume_setup =
+        add_shader!(glass_resume_setup, [Buffer, Buffer], CpuShaderType::Missing);
 
     Ok(FullShaders {
         pathtag_reduce,
@@ -307,6 +330,10 @@ pub(crate) fn full_shaders(
         fine_area_glass,
         fine_msaa8_glass,
         fine_msaa16_glass,
+        fine_area_resume,
+        fine_msaa8_resume,
+        fine_msaa16_resume,
+        glass_resume_setup,
         pathtag_is_cpu: options.use_cpu,
     })
 }

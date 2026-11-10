@@ -1,18 +1,21 @@
 // Copyright 2026 the Vello Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Glass phase 0: backdrop snapshots, the external pass hook and skipped markers.
+//! Glass split rendering: backdrop snapshots, the hook, stops, resumes and skipped markers.
 
 use std::sync::{Mutex, Once};
 
-use vello::glass::{GlassMarker, GlassResumeFormat, IRect, MarkerPlacement};
-use vello::kurbo::{Affine, Circle, Rect, Shape};
-use vello::peniko::{Color, Fill, Mix, color::palette};
-use vello::{AaConfig, Scene};
-use vello_research_tests::glass::{
-    Atlas, CaptureBackdrop, background, max_delta, render_pair, render_scene,
+use vello::glass::{
+    GlassFrame, GlassMarker, GlassPasses, GlassPhase, GlassResumeFormat, IRect, MarkerPlacement,
 };
-use vello_research_tests::{TestParams, get_scene_image};
+use vello::kurbo::{Affine, Circle, Rect, Shape};
+use vello::peniko::{Color, Fill, Mix};
+use vello::wgpu::{self, CommandEncoder, Device, Queue, util::DeviceExt};
+use vello::{AaConfig, Renderer, Scene};
+use vello_research_tests::glass::{
+    Atlas, CaptureBackdrop, NoGlass, background, max_delta, render_pair, render_pair_cpu,
+    render_scene,
+};
 
 /// How much of a test scene to build.
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -138,6 +141,7 @@ fn split(width: u32, aa: AaConfig, build: impl Fn(&mut Scene, Part)) -> CaptureB
         width,
         aa,
         GlassResumeFormat::F32,
+        |_| {},
         |scene, marked| build(scene, Part::of(marked)),
         &mut capture,
     );
@@ -485,23 +489,454 @@ fn marker_nested_deeper_than_eight_by_append_is_skipped() {
         "missing `{warned}` in {messages:?}"
     );
 }
+fn marker_with_id(scene: &mut Scene, id: u32, region: IRect, composite: IRect) {
+    scene.push_glass(GlassMarker {
+        id,
+        region,
+        composite,
+    });
+}
+
+/// Renders `build`'s scene unsplit and split with `passes`, returning both outputs.
+fn outputs(
+    aa: AaConfig,
+    resume: GlassResumeFormat,
+    configure: impl Fn(&mut Renderer),
+    build: impl Fn(&mut Scene, bool),
+    passes: &mut dyn GlassPasses,
+) -> (Vec<u8>, Vec<u8>) {
+    render_pair(512, 512, aa, resume, configure, build, passes)
+}
+
+/// Asserts the split render of `build` equals the unsplit one in every byte, with `NoGlass`.
+fn assert_identical(aa: AaConfig, build: impl Fn(&mut Scene, bool)) {
+    let (unsplit, split) = outputs(aa, GlassResumeFormat::F32, |_| {}, build, &mut NoGlass);
+    assert_eq!(max_delta(&unsplit, &split), 0, "split output differs");
+}
+
+/// Asserts the split render is within one level of the unsplit one and logs whether exact.
+fn assert_within_one_level(
+    name: &str,
+    aa: AaConfig,
+    resume: GlassResumeFormat,
+    configure: impl Fn(&mut Renderer),
+    build: impl Fn(&mut Scene, bool),
+) -> u8 {
+    let (unsplit, split) = outputs(aa, resume, configure, build, &mut NoGlass);
+    let delta = max_delta(&unsplit, &split);
+    let differing = unsplit
+        .chunks(4)
+        .zip(split.chunks(4))
+        .filter(|(a, b)| a != b)
+        .count();
+    eprintln!(
+        "glass.identity {name} exact={} max_delta={delta} pixels={differing}",
+        delta == 0
+    );
+    assert!(delta <= 1, "{name}: split differs by {delta} levels");
+    delta
+}
+
+fn plain_scene(scene: &mut Scene, marked: bool) {
+    plain(scene, Part::of(marked));
+}
 
 #[test]
 #[cfg_attr(skip_gpu_tests, ignore)]
-fn cpu_stages_render_markers_without_glass() {
+fn one_marker_without_content_after_is_identical() {
+    assert_identical(AaConfig::Area, |scene, marked| {
+        background(scene);
+        if marked {
+            marker(scene, REGION, COMPOSITE);
+        }
+    });
+}
+
+#[test]
+#[cfg_attr(skip_gpu_tests, ignore)]
+fn content_after_the_marker_is_within_one_level_in_f32() {
+    assert_within_one_level(
+        "content_after_f32",
+        AaConfig::Area,
+        GlassResumeFormat::F32,
+        |_| {},
+        plain_scene,
+    );
+}
+
+#[test]
+#[cfg_attr(skip_gpu_tests, ignore)]
+fn stops_disabled_control_matches_the_stock_pipeline() {
+    // The glass permutation without stops: any difference from stock is the compiler's.
+    let delta = assert_within_one_level(
+        "stops_disabled_control",
+        AaConfig::Area,
+        GlassResumeFormat::F32,
+        |renderer| renderer.set_glass_stops_disabled(true),
+        plain_scene,
+    );
+    assert_eq!(
+        delta, 0,
+        "the stops-disabled glass pipeline differs from stock"
+    );
+}
+
+#[test]
+#[cfg_attr(skip_gpu_tests, ignore)]
+fn content_after_the_marker_is_within_one_level_in_unorm16() {
+    assert_within_one_level(
+        "content_after_unorm16",
+        AaConfig::Area,
+        GlassResumeFormat::Unorm16,
+        |_| {},
+        plain_scene,
+    );
+}
+
+#[test]
+#[cfg_attr(skip_gpu_tests, ignore)]
+fn content_after_the_marker_is_within_one_level_with_msaa16() {
+    assert_within_one_level(
+        "content_after_msaa16",
+        AaConfig::Msaa16,
+        GlassResumeFormat::F32,
+        |_| {},
+        plain_scene,
+    );
+}
+
+#[test]
+#[cfg_attr(skip_gpu_tests, ignore)]
+fn marker_inside_an_opacity_layer_is_identical() {
+    assert_identical(AaConfig::Area, |scene, marked| {
+        background(scene);
+        layer(scene, 0.5, &Rect::new(0.0, 0.0, 512.0, 512.0));
+        fill(
+            scene,
+            [30, 80, 230, 255],
+            &Circle::new((180.0, 180.0), 150.0),
+        );
+        if marked {
+            marker(scene, REGION, COMPOSITE);
+        }
+        scene.pop_layer();
+    });
+}
+
+#[test]
+#[cfg_attr(skip_gpu_tests, ignore)]
+fn marker_inside_a_clip_near_its_edge_is_identical() {
+    // The composite crosses the clip's unaligned left edge at x = 70.
+    let clip = Rect::new(70.0, 70.0, 441.0, 441.0);
+    assert_identical(AaConfig::Area, |scene, marked| {
+        background(scene);
+        layer(scene, 0.8, &clip);
+        fill(
+            scene,
+            [30, 80, 230, 200],
+            &Circle::new((180.0, 180.0), 150.0),
+        );
+        if marked {
+            marker(scene, rect(32, 96, 256, 224), rect(48, 112, 224, 192));
+        }
+        scene.pop_layer();
+    });
+}
+
+#[test]
+#[cfg_attr(skip_gpu_tests, ignore)]
+fn five_nested_layers_resume_through_the_spill_buffer() {
+    // Five open levels, one past BLEND_STACK_SPLIT (4), so the outermost is in the spill buffer.
+    assert_identical(AaConfig::Area, |scene, marked| {
+        background(scene);
+        for i in 0..5_u8 {
+            let inset = 24.0 + 32.0 * f64::from(i);
+            layer(
+                scene,
+                0.9,
+                &Rect::new(inset, inset, 512.0 - inset, 512.0 - inset),
+            );
+            fill(
+                scene,
+                [40 * i, 90, 200 - 30 * i, 160],
+                &Rect::new(inset, inset, 256.0, 512.0 - inset),
+            );
+        }
+        if marked {
+            marker(scene, rect(160, 160, 352, 352), rect(192, 192, 320, 320));
+        }
+        for _ in 0..5 {
+            scene.pop_layer();
+        }
+    });
+}
+
+#[test]
+#[cfg_attr(skip_gpu_tests, ignore)]
+fn three_phases_are_identical() {
+    // Each composite meets the next region, so the markers take phases 1, 2 and 3.
+    let mut capture = CaptureBackdrop::default();
+    let (unsplit, split) = outputs(
+        AaConfig::Area,
+        GlassResumeFormat::F32,
+        |_| {},
+        |scene, marked| {
+            background(scene);
+            if marked {
+                marker_with_id(scene, 0, rect(64, 64, 192, 192), rect(96, 96, 160, 160));
+                marker_with_id(scene, 1, rect(128, 128, 256, 256), rect(160, 160, 224, 224));
+                marker_with_id(scene, 2, rect(192, 192, 320, 320), rect(224, 224, 288, 288));
+            }
+        },
+        &mut capture,
+    );
+    assert_eq!(capture.phases, [1, 2, 3]);
+    let phases: Vec<_> = capture.frame.iter().map(|p| (p.id, p.phase)).collect();
+    assert_eq!(phases, [(0, 1), (1, 2), (2, 3)]);
+    assert_eq!(max_delta(&unsplit, &split), 0, "split output differs");
+}
+
+#[test]
+#[cfg_attr(skip_gpu_tests, ignore)]
+fn sixteen_disjoint_markers_share_one_phase() {
+    let mut capture = CaptureBackdrop::default();
+    let (unsplit, split) = outputs(
+        AaConfig::Area,
+        GlassResumeFormat::F32,
+        |_| {},
+        |scene, marked| {
+            background(scene);
+            if !marked {
+                return;
+            }
+            for id in 0..16 {
+                let x = 128 * (id % 4);
+                let y = 128 * (id / 4);
+                marker_with_id(
+                    scene,
+                    id as u32,
+                    rect(x + 16, y + 16, x + 112, y + 112),
+                    rect(x + 32, y + 32, x + 96, y + 96),
+                );
+            }
+        },
+        &mut capture,
+    );
+    assert_eq!(capture.phases, [1]);
+    assert_eq!(capture.placements.len(), 16);
+    assert_eq!(max_delta(&unsplit, &split), 0, "split output differs");
+}
+
+/// Premultiplied glass the phase-one hook writes over marker 0's composite.
+const GLASS: [f32; 4] = [0.25, 0.0, 0.0, 0.5];
+
+/// Writes [`GLASS`] into marker 0's glass slot in phase 1 and captures the backdrops.
+#[derive(Default)]
+struct WriteGlass {
+    capture: CaptureBackdrop,
+}
+
+impl GlassPasses for WriteGlass {
+    fn prepare(&mut self, device: &Device, queue: &Queue, frame: &GlassFrame<'_>) {
+        self.capture.prepare(device, queue, frame);
+    }
+
+    fn record(&mut self, device: &Device, encoder: &mut CommandEncoder, phase: &GlassPhase<'_>) {
+        if phase.index == 1 {
+            let m0 = phase.markers.iter().find(|p| p.id == 0).unwrap();
+            let width = (m0.composite.x1 - m0.composite.x0) as u32;
+            let height = (m0.composite.y1 - m0.composite.y0) as u32;
+            // GLASS as half floats: 0.25, 0.0, 0.0 and 0.5.
+            let texel = [0x3400_u16, 0, 0, 0x3800];
+            let data: Vec<u8> = (0..width * height)
+                .flat_map(|_| texel.iter().flat_map(|c| c.to_le_bytes()))
+                .collect();
+            let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("glass test G"),
+                contents: &data,
+                usage: wgpu::BufferUsages::COPY_SRC,
+            });
+            assert_eq!(
+                phase.glass_atlas.format(),
+                wgpu::TextureFormat::Rgba16Float,
+                "the default glass atlas format"
+            );
+            encoder.copy_buffer_to_texture(
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        // Eight bytes per texel; the composite is a multiple of 32 px wide.
+                        bytes_per_row: Some(width * 8),
+                        rows_per_image: None,
+                    },
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: phase.glass_atlas,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: m0.glass_origin.0,
+                        y: m0.glass_origin.1,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        self.capture.record(device, encoder, phase);
+    }
+}
+
+#[test]
+#[cfg_attr(skip_gpu_tests, ignore)]
+fn second_phase_snapshot_includes_the_first_phase_glass() {
+    let m0_composite = rect(96, 96, 224, 160);
+    let m1_region = rect(160, 128, 320, 256);
+    let mut passes = WriteGlass::default();
+    let _ = outputs(
+        AaConfig::Area,
+        GlassResumeFormat::F32,
+        |_| {},
+        |scene, marked| {
+            background(scene);
+            if marked {
+                marker_with_id(scene, 0, rect(64, 64, 256, 192), m0_composite);
+                marker_with_id(scene, 1, m1_region, rect(192, 160, 288, 224));
+            }
+        },
+        &mut passes,
+    );
+    let capture = &passes.capture;
+    assert_eq!(capture.phases, [1, 2]);
+    let m1 = capture.frame.iter().find(|p| p.id == 1).unwrap();
+    assert_eq!(m1.phase, 2);
+    let mut scene = Scene::new();
+    background(&mut scene);
+    let backdrop = render_scene(512, 512, AaConfig::Area, &scene);
+    let atlas = capture.backdrop();
+    let overlap = intersect(m0_composite, m1_region);
+    assert!(!overlap.is_empty(), "the test markers overlap");
+    let mut worst = 0.0_f64;
+    for y in m1_region.y0..m1_region.y1 {
+        for x in m1_region.x0..m1_region.x1 {
+            let got = atlas.pixel(
+                m1.backdrop_origin.0 + (x - m1_region.x0) as u32,
+                m1.backdrop_origin.1 + (y - m1_region.y0) as u32,
+            );
+            let i = ((y as u32 * 512 + x as u32) * 4) as usize;
+            let bg = &backdrop[i..i + 4];
+            let inside = x >= overlap.x0 && x < overlap.x1 && y >= overlap.y0 && y < overlap.y1;
+            for c in 0..4 {
+                let b = f64::from(bg[c]) / 255.0;
+                let want = if inside {
+                    f64::from(GLASS[c]) + (1.0 - f64::from(GLASS[3])) * b
+                } else {
+                    b
+                };
+                let delta = (f64::from(got[c]) - want * 255.0).abs();
+                worst = worst.max(delta);
+                assert!(
+                    delta <= 1.0,
+                    "({x}, {y}) channel {c}: got {}, want {:.2} (inside overlap: {inside})",
+                    got[c],
+                    want * 255.0
+                );
+            }
+        }
+    }
+    eprintln!("glass.second_phase max_delta={worst:.3}");
+}
+
+#[test]
+#[cfg_attr(skip_gpu_tests, ignore)]
+fn marker_partly_off_screen_is_identical() {
+    let mut capture = CaptureBackdrop::default();
+    let (unsplit, split) = outputs(
+        AaConfig::Area,
+        GlassResumeFormat::F32,
+        |_| {},
+        |scene, marked| {
+            background(scene);
+            if marked {
+                marker(scene, rect(-64, 400, 200, 600), rect(-32, 432, 160, 560));
+            }
+        },
+        &mut capture,
+    );
+    assert_eq!(capture.phases, [1]);
+    assert_eq!(capture.frame[0].region, rect(0, 400, 208, 512));
+    assert_eq!(capture.frame[0].composite, rect(0, 432, 160, 512));
+    assert_eq!(max_delta(&unsplit, &split), 0, "split output differs");
+}
+
+#[test]
+#[cfg_attr(skip_gpu_tests, ignore)]
+fn marker_wholly_off_screen_is_skipped() {
+    let mut capture = CaptureBackdrop::default();
+    let (unsplit, split) = outputs(
+        AaConfig::Area,
+        GlassResumeFormat::F32,
+        |_| {},
+        |scene, marked| {
+            background(scene);
+            if marked {
+                marker(scene, rect(600, 600, 700, 700), rect(616, 616, 684, 684));
+            }
+            after_marker(scene);
+        },
+        &mut capture,
+    );
+    assert!(capture.frame.is_empty(), "prepare was not called");
+    assert!(capture.phases.is_empty(), "record was not called");
+    assert_eq!(max_delta(&unsplit, &split), 0, "split output differs");
+}
+
+#[test]
+#[cfg_attr(skip_gpu_tests, ignore)]
+fn render_to_texture_ignores_markers() {
+    let clip = Rect::new(70.0, 70.0, 441.0, 441.0);
     let render = |marked: bool| {
         let mut scene = Scene::new();
-        plain(&mut scene, Part::of(marked));
-        let params = TestParams {
-            base_color: Some(palette::css::WHITE),
-            use_cpu: true,
-            ..TestParams::new("glass_cpu", 512, 512)
-        };
-        pollster::block_on(get_scene_image(&params, &scene)).unwrap()
+        background(&mut scene);
+        layer(&mut scene, 0.7, &clip);
+        if marked {
+            marker(&mut scene, REGION, COMPOSITE);
+        }
+        after_marker(&mut scene);
+        scene.pop_layer();
+        if marked {
+            marker(&mut scene, rect(0, 0, 64, 64), rect(16, 16, 48, 48));
+        }
+        render_scene(512, 512, AaConfig::Area, &scene)
     };
-    let (unmarked, marked) = (render(false), render(true));
-    assert!(
-        unmarked.data.data() == marked.data.data(),
+    assert_eq!(
+        max_delta(&render(false), &render(true)),
+        0,
+        "markers changed the stock path"
+    );
+}
+
+#[test]
+#[cfg_attr(skip_gpu_tests, ignore)]
+fn cpu_stages_ignore_glass_markers() {
+    let logs = capture_logs();
+    let mut capture = CaptureBackdrop::default();
+    let (unmarked, marked) = render_pair_cpu(512, 512, plain_scene, &mut capture);
+    assert_eq!(
+        max_delta(&unmarked, &marked),
+        0,
         "the CPU stages render markers as nothing"
+    );
+    assert!(capture.phases.is_empty(), "the hook is not called");
+    let messages = logs.0.lock().unwrap();
+    let warned = "glass.cpu.unsupported markers=1";
+    assert!(
+        messages.iter().any(|m| m == warned),
+        "missing `{warned}` in {messages:?}"
     );
 }

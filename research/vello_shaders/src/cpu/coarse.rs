@@ -360,6 +360,8 @@ fn coarse_main(
                                 tile_state.write_end_clip(config, bump, ptcl, blend, alpha);
                                 render_blend_depth -= 1;
                             }
+                            // The CPU stages render without glass.
+                            DrawTag::GLASS => {}
                             _ => todo!(),
                         }
                     }

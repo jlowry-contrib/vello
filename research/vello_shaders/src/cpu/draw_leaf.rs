@@ -47,6 +47,7 @@ fn draw_leaf_main(
                 || tag_word == DrawTag::IMAGE
                 || tag_word == DrawTag::BEGIN_CLIP
                 || tag_word == DrawTag::BLUR_RECT
+                || tag_word == DrawTag::GLASS
             {
                 let bbox = path_bbox[m.path_ix as usize];
                 let transform = Transform::read(config.layout.transform_base, bbox.trans_ix, scene);
@@ -191,7 +192,7 @@ fn draw_leaf_main(
                         info[di + 9] = scene[dd as usize + 3];
                         info[di + 10] = scene[dd as usize + 4];
                     }
-                    DrawTag::BEGIN_CLIP => {
+                    DrawTag::BEGIN_CLIP | DrawTag::GLASS => {
                         info[di] = draw_flags;
                     }
                     _ => todo!("unhandled draw tag {:x}", tag_word.0),

@@ -5,3 +5,6 @@ fine
 + fine_area
 + fine_msaa8: msaa msaa8
 + fine_msaa16: msaa msaa16
++ fine_area_glass: glass
++ fine_msaa8_glass: msaa msaa8 glass
++ fine_msaa16_glass: msaa msaa16 glass

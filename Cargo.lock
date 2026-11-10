@@ -4596,6 +4596,7 @@ dependencies = [
  "anyhow",
  "futures-intrusive",
  "image",
+ "log",
  "nv-flip",
  "oxipng",
  "png",

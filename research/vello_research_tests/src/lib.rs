@@ -43,6 +43,10 @@ use vello::wgpu::{
 };
 use vello::{AaConfig, RendererOptions, Scene, util::RenderContext, util::block_on_wgpu};
 
+// A dev-dependency for the integration tests only.
+#[cfg(test)]
+use log as _;
+
 mod compare;
 pub mod glass;
 mod snapshot;

@@ -14,6 +14,7 @@ use wgpu::{
 
 use crate::{
     Error, Result,
+    glass::{GlassPasses, GlassPhase, MarkerPlacement, phase_placements},
     low_level::{BufferProxy, Command, ImageProxy, Recording, ResourceId, ResourceProxy, ShaderId},
     recording::BindType,
 };
@@ -91,6 +92,15 @@ pub(crate) enum ExternalResource<'a> {
     #[expect(unused, reason = "No buffers are accepted as arguments currently")]
     Buffer(BufferProxy, &'a Buffer),
     Image(ImageProxy, &'a TextureView),
+}
+
+/// The glass passes and the resources they record against, for `Command::External`.
+pub(crate) struct ExternalPasses<'a> {
+    pub(crate) passes: &'a mut dyn GlassPasses,
+    pub(crate) backdrop: &'a Texture,
+    pub(crate) glass: &'a Texture,
+    /// Placed markers, ordered by phase.
+    pub(crate) placements: &'a [MarkerPlacement],
 }
 
 /// A buffer can exist either on the GPU or on CPU.
@@ -385,6 +395,7 @@ impl WgpuEngine {
         external_resources: &[ExternalResource<'_>],
         label: &'static str,
         #[cfg(feature = "wgpu-profiler")] profiler: &mut wgpu_profiler::GpuProfiler,
+        mut external: Option<&mut ExternalPasses<'_>>,
     ) -> Result<()> {
         let mut free_bufs: HashSet<ResourceId> = HashSet::default();
         let mut free_images: HashSet<ResourceId> = HashSet::default();
@@ -743,6 +754,21 @@ impl WgpuEngine {
                 }
                 Command::FreeBuffer(proxy) => {
                     free_bufs.insert(proxy.id);
+                }
+                Command::External(index) => {
+                    let external = external
+                        .as_deref_mut()
+                        .expect("a recording with external commands needs external passes");
+                    external.passes.record(
+                        device,
+                        &mut encoder,
+                        &GlassPhase {
+                            index: *index,
+                            backdrop_atlas: external.backdrop,
+                            glass_atlas: external.glass,
+                            markers: phase_placements(external.placements, *index),
+                        },
+                    );
                 }
                 Command::FreeImage(proxy) => {
                     free_images.insert(proxy.id);

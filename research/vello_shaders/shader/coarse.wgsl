@@ -64,6 +64,17 @@ var<workgroup> sh_tile_base: array<u32, WG_SIZE>;
 var<private> cmd_offset: u32;
 var<private> cmd_limit: u32;
 
+// The most open layers a glass marker may sit under; mirrors `MAX_GLASS_LAYERS` in
+// `vello_encoding`.
+const MAX_GLASS_LAYERS = 8u;
+
+// Open layers of this tile, indexed by render blend depth: the BEGIN_CLIP draw object,
+// and the clip coverage a glass marker already wrote (bit set in `open_cached`), which
+// END_CLIP reuses because writing a path consumes its tile's segment count.
+var<private> open_begin: array<u32, MAX_GLASS_LAYERS>;
+var<private> open_fill: array<vec3<u32>, MAX_GLASS_LAYERS>;
+var<private> open_cached: u32;
+
 // Make sure there is space for a command of given size, plus a jump if needed
 fn alloc_cmd(size: u32) {
     if cmd_offset + size >= cmd_limit {
@@ -85,7 +96,8 @@ fn alloc_cmd(size: u32) {
     }
 }
 
-fn write_path(tile: Tile, tile_ix: u32, draw_flags: u32) {
+// Allocates the tile's segments and returns its `CmdFill` words, or `x == ~0u` for a solid tile.
+fn path_fill(tile: Tile, tile_ix: u32, draw_flags: u32) -> vec3<u32> {
     // We overload the "segments" field to store both count (written by
     // path_count stage) and segment allocation (used by path_tiling and
     // fine).
@@ -93,20 +105,31 @@ fn write_path(tile: Tile, tile_ix: u32, draw_flags: u32) {
     if n_segs != 0u {
         var seg_ix = atomicAdd(&bump.segments, n_segs);
         tiles[tile_ix].segment_count_or_ix = ~seg_ix;
-        alloc_cmd(4u);
-        ptcl[cmd_offset] = CMD_FILL;
         let even_odd = (draw_flags & DRAW_INFO_FLAGS_FILL_RULE_BIT) != 0u;
         let size_and_rule = (n_segs << 1u) | u32(even_odd);
         let fill = CmdFill(size_and_rule, seg_ix, tile.backdrop);
-        ptcl[cmd_offset + 1u] = fill.size_and_rule;
-        ptcl[cmd_offset + 2u] = fill.seg_data;
-        ptcl[cmd_offset + 3u] = u32(fill.backdrop);
+        return vec3(fill.size_and_rule, fill.seg_data, u32(fill.backdrop));
+    }
+    return vec3(~0u, 0u, 0u);
+}
+
+fn write_fill(fill: vec3<u32>) {
+    if fill.x != ~0u {
+        alloc_cmd(4u);
+        ptcl[cmd_offset] = CMD_FILL;
+        ptcl[cmd_offset + 1u] = fill.x;
+        ptcl[cmd_offset + 2u] = fill.y;
+        ptcl[cmd_offset + 3u] = fill.z;
         cmd_offset += 4u;
     } else {
         alloc_cmd(1u);
         ptcl[cmd_offset] = CMD_SOLID;
         cmd_offset += 1u;
     }
+}
+
+fn write_path(tile: Tile, tile_ix: u32, draw_flags: u32) {
+    write_fill(path_fill(tile, tile_ix, draw_flags));
 }
 
 fn write_color(color: CmdColor) {
@@ -143,6 +166,55 @@ fn write_end_clip(end_clip: CmdEndClip) {
     ptcl[cmd_offset + 1u] = end_clip.blend;
     ptcl[cmd_offset + 2u] = bitcast<u32>(end_clip.alpha);
     cmd_offset += 3u;
+}
+
+fn write_glass_flatten(level: u32, blend: u32, alpha: u32) {
+    alloc_cmd(4u);
+    ptcl[cmd_offset] = CMD_GLASS_FLATTEN;
+    ptcl[cmd_offset + 1u] = level;
+    ptcl[cmd_offset + 2u] = blend;
+    ptcl[cmd_offset + 3u] = alpha;
+    cmd_offset += 4u;
+}
+
+fn write_glass_cmd(cmd: u32, marker: u32) {
+    alloc_cmd(2u);
+    ptcl[cmd_offset] = cmd;
+    ptcl[cmd_offset + 1u] = marker;
+    cmd_offset += 2u;
+}
+
+// Writes a glass marker's commands for tile (x, y): the flattened backdrop of the open
+// layers, the snapshot and, unless the tile is clipped away, the stop and composite.
+fn write_glass(dd: u32, x: u32, y: u32, depth: u32, clip_zero: bool) {
+    // `Scene::append` can nest a marker deeper than `push_glass` checked.
+    if config.glass_phases == 0u || depth > MAX_GLASS_LAYERS {
+        return;
+    }
+    for (var i = 0u; i < depth; i += 1u) {
+        let level = depth - 1u - i;
+        let begin = draw_monoids[open_begin[level]];
+        if (open_cached & (1u << level)) == 0u {
+            let clip_path = paths[begin.path_ix];
+            let stride = clip_path.bbox.z - clip_path.bbox.x;
+            let tile_ix = clip_path.tiles + (y - clip_path.bbox.y) * stride + x - clip_path.bbox.x;
+            open_fill[level] = path_fill(tiles[tile_ix], tile_ix, info_bin_data[begin.info_offset]);
+            open_cached |= 1u << level;
+        }
+        write_fill(open_fill[level]);
+        let begin_dd = config.drawdata_base + begin.scene_offset;
+        write_glass_flatten(level, scene[begin_dd], scene[begin_dd + 1u]);
+    }
+    let marker = scene[dd];
+    write_glass_cmd(CMD_GLASS_SNAPSHOT, marker);
+    let composite_min = scene[dd + 1u];
+    let composite_max = scene[dd + 2u];
+    let in_composite = x >= (composite_min & 0xffffu) && x < (composite_max & 0xffffu) &&
+        y >= (composite_min >> 16u) && y < (composite_max >> 16u);
+    if !clip_zero && in_composite {
+        write_glass_cmd(CMD_GLASS_STOP, marker);
+        write_glass_cmd(CMD_GLASS_COMPOSITE, marker);
+    }
 }
 
 fn write_blurred_rounded_rect(color: CmdColor, info_offset: u32) {
@@ -338,7 +410,8 @@ fn main(
             // crosses this tile and then this draw object should not contribute to the tile if its
             // backdrop (i.e. the winding number of its top-left corner) is even.
             let backdrop_clear = select(tile.backdrop, abs(tile.backdrop) & 1, even_odd) == 0;
-            let include_tile = n_segs != 0u || (backdrop_clear == is_clip) || is_blend;
+            // Glass covers every tile of its region, even where an edge lies on a tile boundary.
+            let include_tile = n_segs != 0u || (backdrop_clear == is_clip) || is_blend || tag == DRAWTAG_GLASS;
             if include_tile {
                 let el_slice = el_ix / 32u;
                 let el_mask = 1u << (el_ix & 31u);
@@ -418,6 +491,10 @@ fn main(
                             clip_zero_depth = clip_depth + 1u;
                         } else {
                             write_begin_clip();
+                            if render_blend_depth < MAX_GLASS_LAYERS {
+                                open_begin[render_blend_depth] = drawobj_ix;
+                                open_cached &= ~(1u << render_blend_depth);
+                            }
                             render_blend_depth += 1u;
                             max_blend_depth = max(max_blend_depth, render_blend_depth);
                         }
@@ -425,11 +502,19 @@ fn main(
                     }
                     case DRAWTAG_END_CLIP: {
                         clip_depth -= 1u;
-                        write_path(tile, tile_ix, draw_flags);
+                        let level = render_blend_depth - 1u;
+                        if level < MAX_GLASS_LAYERS && (open_cached & (1u << level)) != 0u {
+                            write_fill(open_fill[level]);
+                        } else {
+                            write_path(tile, tile_ix, draw_flags);
+                        }
                         let blend = scene[dd];
                         let alpha = bitcast<f32>(scene[dd + 1u]);
                         write_end_clip(CmdEndClip(blend, alpha));
                         render_blend_depth -= 1u;
+                    }
+                    case DRAWTAG_GLASS: {
+                        write_glass(dd, bin_tile_x + tile_x, bin_tile_y + tile_y, render_blend_depth, false);
                     }
                     default: {}
                 }
@@ -444,6 +529,9 @@ fn main(
                             clip_zero_depth = 0u;
                         }
                         clip_depth -= 1u;
+                    }
+                    case DRAWTAG_GLASS: {
+                        write_glass(dd, bin_tile_x + tile_x, bin_tile_y + tile_y, render_blend_depth, true);
                     }
                     default: {}
                 }

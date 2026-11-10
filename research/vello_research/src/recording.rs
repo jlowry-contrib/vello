@@ -38,6 +38,7 @@ pub struct BufferProxy {
 pub enum ImageFormat {
     Rgba8,
     Bgra8,
+    Rgba16Float,
 }
 
 /// Proxy used as a handle to an image.
@@ -84,6 +85,8 @@ pub enum Command {
     DispatchIndirect(ShaderId, BufferProxy, u64, Vec<ResourceProxy>),
     #[cfg(feature = "debug_layers")]
     Draw(DrawParams),
+    /// Commands the external glass passes to record phase `k`.
+    External(u32),
 }
 
 /// The type of resource that will be bound to a slot in a shader.
@@ -246,6 +249,7 @@ impl ImageFormat {
         match self {
             Self::Rgba8 => wgpu::TextureFormat::Rgba8Unorm,
             Self::Bgra8 => wgpu::TextureFormat::Bgra8Unorm,
+            Self::Rgba16Float => wgpu::TextureFormat::Rgba16Float,
         }
     }
 
@@ -254,6 +258,7 @@ impl ImageFormat {
         match format {
             wgpu::TextureFormat::Rgba8Unorm => Some(Self::Rgba8),
             wgpu::TextureFormat::Bgra8Unorm => Some(Self::Bgra8),
+            wgpu::TextureFormat::Rgba16Float => Some(Self::Rgba16Float),
             _ => None,
         }
     }

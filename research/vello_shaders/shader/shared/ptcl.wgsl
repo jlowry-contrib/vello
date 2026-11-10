@@ -23,6 +23,13 @@ const CMD_BEGIN_CLIP = 10u;
 const CMD_END_CLIP = 11u;
 const CMD_JUMP = 12u;
 const CMD_BLUR_RECT = 13u;
+// Glass commands, emitted only when `config.glass_phases` is non-zero.
+// Flatten words: tag, open level, that level's blend mode, its alpha bits.
+const CMD_GLASS_FLATTEN = 14u;
+// Snapshot, stop and composite words: tag, marker index.
+const CMD_GLASS_SNAPSHOT = 15u;
+const CMD_GLASS_STOP = 16u;
+const CMD_GLASS_COMPOSITE = 17u;
 
 // The individual PTCL structs are written here, but read/write is by
 // hand in the relevant shaders

@@ -73,6 +73,52 @@ const SAMPLE_WORDS_PER_PIXEL = 4u;
 var<storage> mask_lut: array<u32, 2048u>;
 #endif
 
+#endif
+
+// Glass bindings, after the MSAA mask LUT when there is one.
+#ifdef glass
+#ifdef msaa
+const GLASS_MARKERS_INDEX: u32 = 9;
+const GLASS_STATE_INDEX: u32 = 10;
+const GLASS_BACKDROP_INDEX: u32 = 11;
+const GLASS_ATLAS_INDEX: u32 = 12;
+#else
+const GLASS_MARKERS_INDEX: u32 = 8;
+const GLASS_STATE_INDEX: u32 = 9;
+const GLASS_BACKDROP_INDEX: u32 = 10;
+const GLASS_ATLAS_INDEX: u32 = 11;
+#endif
+
+// One row of the glass marker table; mirrors `GlassMarkerRow` in `vello`.
+struct GlassMarker {
+    // Region and composite in tiles: x0, y0, x1, y1.
+    region: vec4<u32>,
+    composite: vec4<u32>,
+    // 0 for a marker the frame leaves out.
+    phase: u32,
+    // Slot origins in pixels, x | y << 16.
+    backdrop_origin: u32,
+    glass_origin: u32,
+    pad: u32,
+}
+
+// The phase this permutation runs; snapshots and stops are for later phases only.
+const GLASS_RUNNING_PHASE = 0u;
+
+@group(0) @binding(GLASS_MARKERS_INDEX)
+var<storage> glass_markers: array<GlassMarker>;
+
+@group(0) @binding(GLASS_STATE_INDEX)
+var<storage, read_write> glass_state: array<u32>;
+
+@group(0) @binding(GLASS_BACKDROP_INDEX)
+var glass_backdrop: texture_storage_2d<rgba8unorm, write>;
+
+@group(0) @binding(GLASS_ATLAS_INDEX)
+var glass_atlas: texture_2d<f32>;
+#endif
+
+#ifdef msaa
 const WG_SIZE = 64u;
 var<workgroup> sh_count: array<u32, WG_SIZE>;
 
@@ -994,6 +1040,23 @@ fn bicubic_sample(
 
 const PIXELS_PER_THREAD = 4u;
 
+// Closes a layer: mixes its content `fg_layer`, clipped by `area` and faded by `alpha`, into `bg`.
+fn end_clip_mix(bg: vec4<f32>, fg_layer: vec4<f32>, area: f32, alpha: f32, blend: u32) -> vec4<f32> {
+    let fg = fg_layer * area * alpha;
+    if blend == LUMINANCE_MASK_LAYER {
+        // TODO: Does this case apply more generally?
+        // See https://github.com/linebender/vello/issues/1061
+        // TODO: How do we handle anti-aliased edges here?
+        // This is really an imaging model question
+        if area == 0f {
+            return bg;
+        }
+        let luminance = clamp(svg_lum(unpremultiply(fg)) * fg.a, 0.0, 1.0);
+        return bg * luminance;
+    }
+    return blend_mix_compose(bg, fg, blend);
+}
+
 #ifndef msaa
 
 // Analytic area anti-aliasing.
@@ -1083,6 +1146,10 @@ fn main(
     var blend_stack: array<array<u32, PIXELS_PER_THREAD>, BLEND_STACK_SPLIT>;
     var clip_depth = 0u;
     var area: array<f32, PIXELS_PER_THREAD>;
+#ifdef glass
+    // The backdrop at a glass marker: the current layer flattened through the open levels.
+    var flat: array<vec4<f32>, PIXELS_PER_THREAD>;
+#endif
     var cmd_ix = tile_ix * PTCL_INITIAL_ALLOC;
     let blend_offset = ptcl[cmd_ix];
     cmd_ix += 1u;
@@ -1149,24 +1216,57 @@ fn main(
                         bg_rgba = blend_spill[local_blend_start + i];
                     }
                     let bg = unpack4x8unorm(bg_rgba);
-                    let fg = rgba[i] * area[i] * end_clip.alpha;
-                    if end_clip.blend == LUMINANCE_MASK_LAYER {
-                        // TODO: Does this case apply more generally?
-                        // See https://github.com/linebender/vello/issues/1061
-                        // TODO: How do we handle anti-aliased edges here?
-                        // This is really an imaging model question
-                        if area[i] == 0f {
-                            rgba[i] = bg;
-                            continue;
-                        }
-                        let luminance = clamp(svg_lum(unpremultiply(fg)) * fg.a, 0.0, 1.0);
-                        rgba[i] = bg * luminance;
-                    } else {
-                        rgba[i] = blend_mix_compose(bg, fg, end_clip.blend);
-                    }
+                    rgba[i] = end_clip_mix(bg, rgba[i], area[i], end_clip.alpha, end_clip.blend);
                 }
                 cmd_ix += 3u;
             }
+#ifdef glass
+            case CMD_GLASS_FLATTEN: {
+                // Closes open level `level` into `flat`, leaving `rgba` and the blend stack as they are.
+                let level = ptcl[cmd_ix + 1u];
+                let blend = ptcl[cmd_ix + 2u];
+                let alpha = bitcast<f32>(ptcl[cmd_ix + 3u]);
+                for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
+                    if level + 1u == clip_depth {
+                        flat[i] = rgba[i];
+                    }
+                    var bg_rgba: u32;
+                    if level < BLEND_STACK_SPLIT {
+                        bg_rgba = blend_stack[level][i];
+                    } else {
+                        let blend_in_scratch = level - BLEND_STACK_SPLIT;
+                        let local_tile_ix = local_id.x * PIXELS_PER_THREAD + local_id.y * TILE_WIDTH;
+                        let local_blend_start = blend_offset + blend_in_scratch * TILE_WIDTH * TILE_HEIGHT + local_tile_ix;
+                        bg_rgba = blend_spill[local_blend_start + i];
+                    }
+                    flat[i] = end_clip_mix(unpack4x8unorm(bg_rgba), flat[i], area[i], alpha, blend);
+                }
+                cmd_ix += 4u;
+            }
+            case CMD_GLASS_SNAPSHOT: {
+                let marker = glass_markers[ptcl[cmd_ix + 1u]];
+                if marker.phase > GLASS_RUNNING_PHASE {
+                    let tile_size = vec2(TILE_WIDTH, TILE_HEIGHT);
+                    let region_min = marker.region.xy * tile_size;
+                    // A tile can reach past the target's right or bottom edge.
+                    let region_max = min(marker.region.zw * tile_size, vec2(config.target_width, config.target_height));
+                    let origin = vec2(marker.backdrop_origin & 0xffffu, marker.backdrop_origin >> 16u);
+                    let xy_uint = vec2<u32>(xy);
+                    for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
+                        let coords = xy_uint + vec2(i, 0u);
+                        if all(coords >= region_min) && all(coords < region_max) {
+                            let backdrop = select(flat[i], rgba[i], clip_depth == 0u);
+                            textureStore(glass_backdrop, vec2<i32>(origin + coords - region_min), backdrop);
+                        }
+                    }
+                }
+                cmd_ix += 2u;
+            }
+            case CMD_GLASS_STOP, CMD_GLASS_COMPOSITE: {
+                // Phase 0 neither stops nor composites yet.
+                cmd_ix += 2u;
+            }
+#endif
             case CMD_JUMP: {
                 cmd_ix = ptcl[cmd_ix + 1u];
             }

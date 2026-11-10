@@ -158,8 +158,10 @@ use debug::DebugLayers;
 #[cfg(feature = "wgpu")]
 use vello_encoding::{BumpAllocators, Resolver};
 #[cfg(feature = "wgpu")]
-use wgpu_engine::{ExternalResource, WgpuEngine};
+use wgpu_engine::{ExternalPasses, ExternalResource, WgpuEngine};
 
+#[cfg(feature = "wgpu")]
+use glass::{GlassAtlasFormat, GlassFrame, GlassPasses, GlassResumeFormat};
 #[cfg(feature = "wgpu")]
 use std::{num::NonZeroUsize, sync::atomic::AtomicBool};
 #[cfg(feature = "wgpu")]
@@ -296,6 +298,12 @@ pub enum Error {
     #[error("wgpu Error from scope")]
     WgpuErrorFromScope(#[from] wgpu::Error),
 
+    /// A glass atlas needs a texture larger than the device allows.
+    /// The fields are the atlas width and height and the device's limit, in pixels.
+    #[cfg(feature = "wgpu")]
+    #[error("Glass atlas of {0}x{1} exceeds the device's {2} px texture limit")]
+    GlassAtlasTooLarge(u32, u32, u32),
+
     /// Failed to create [`GpuProfiler`].
     /// See [`wgpu_profiler::CreationError`] for more information.
     #[cfg(feature = "wgpu-profiler")]
@@ -335,6 +343,11 @@ pub struct Renderer {
     resolver: Resolver,
     image_atlas: Option<recording::ImageProxy>,
     shaders: FullShaders,
+    glass_backdrop: Option<(wgpu::Texture, TextureView)>,
+    glass_atlas: Option<(wgpu::Texture, TextureView)>,
+    glass_resume_format: GlassResumeFormat,
+    glass_atlas_format: GlassAtlasFormat,
+    glass_stops_disabled: bool,
     #[cfg(feature = "debug_layers")]
     debug: debug::DebugRenderer,
     #[cfg(feature = "wgpu-profiler")]
@@ -422,6 +435,52 @@ impl Default for RendererOptions {
     }
 }
 
+/// Grows a glass atlas to hold `size` (never shrinking it) and returns a proxy for it.
+///
+/// A format change recreates the atlas.
+#[cfg(feature = "wgpu")]
+fn grow_glass_atlas(
+    atlas: &mut Option<(wgpu::Texture, TextureView)>,
+    device: &Device,
+    label: &'static str,
+    format: recording::ImageFormat,
+    size: (u32, u32),
+) -> Result<recording::ImageProxy> {
+    let wgpu_format = format.to_wgpu();
+    let current = atlas
+        .as_ref()
+        .filter(|(texture, _)| texture.format() == wgpu_format)
+        .map(|(texture, _)| (texture.width(), texture.height()));
+    let (width, height) = current.map_or(size, |(w, h)| (w.max(size.0), h.max(size.1)));
+    if current != Some((width, height)) {
+        let max = device.limits().max_texture_dimension_2d;
+        if width > max || height > max {
+            return Err(Error::GlassAtlasTooLarge(width, height, max));
+        }
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu_format,
+            // Hooks and tests copy into and out of the atlases.
+            usage: wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        *atlas = Some((texture, view));
+    }
+    Ok(recording::ImageProxy::new(width, height, format))
+}
+
 #[cfg(feature = "wgpu")]
 struct RenderResult {
     bump: Option<BumpAllocators>,
@@ -451,6 +510,11 @@ impl Renderer {
             resolver: Resolver::new(),
             image_atlas: None,
             shaders,
+            glass_backdrop: None,
+            glass_atlas: None,
+            glass_resume_format: GlassResumeFormat::default(),
+            glass_atlas_format: GlassAtlasFormat::default(),
+            glass_stops_disabled: false,
             #[cfg(feature = "debug_layers")]
             debug,
             #[cfg(feature = "wgpu-profiler")]
@@ -501,6 +565,7 @@ impl Renderer {
             "render_to_texture",
             #[cfg(feature = "wgpu-profiler")]
             &mut self.profiler,
+            None,
         )?;
         // N.B. This is horrible; this integration of wgpu-profiler really needs some work...
         #[cfg(feature = "wgpu-profiler")]
@@ -515,6 +580,131 @@ impl Renderer {
         }
 
         Ok(())
+    }
+
+    /// Renders a scene with glass to the target texture, calling `passes` once per glass phase.
+    ///
+    /// The target is as for [`render_to_texture`](Self::render_to_texture). A scene whose
+    /// markers all fall outside the target renders as `render_to_texture` does, as does any
+    /// scene when the CPU stages are in use (logged as `glass.cpu.unsupported`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::GlassAtlasTooLarge`] if an atlas would exceed the device's texture
+    /// limit, and the errors of `render_to_texture`.
+    pub fn render_to_texture_with_glass(
+        &mut self,
+        device: &Device,
+        queue: &Queue,
+        scene: &Scene,
+        texture: &TextureView,
+        params: &RenderParams,
+        passes: &mut dyn GlassPasses,
+    ) -> Result<()> {
+        let plan = glass::plan(&scene.encoding().glass, params.width, params.height);
+        if plan.placements.is_empty() {
+            return self.render_to_texture(device, queue, scene, texture, params);
+        }
+        if self.engine.use_cpu {
+            log::warn!("glass.cpu.unsupported markers={}", plan.placements.len());
+            return self.render_to_texture(device, queue, scene, texture, params);
+        }
+        let glass_format = match self.glass_atlas_format {
+            GlassAtlasFormat::Rgba16Float => recording::ImageFormat::Rgba16Float,
+            GlassAtlasFormat::Rgba8Unorm => recording::ImageFormat::Rgba8,
+        };
+        let backdrop_proxy = grow_glass_atlas(
+            &mut self.glass_backdrop,
+            device,
+            "vello.glass_backdrop",
+            recording::ImageFormat::Rgba8,
+            plan.backdrop_size,
+        )?;
+        let glass_proxy = grow_glass_atlas(
+            &mut self.glass_atlas,
+            device,
+            "vello.glass_atlas",
+            glass_format,
+            plan.glass_size,
+        )?;
+        passes.prepare(
+            device,
+            queue,
+            &GlassFrame {
+                markers: &plan.placements,
+                phases: plan.phases,
+            },
+        );
+        let glass = render::GlassRender {
+            rows: &plan.rows,
+            phases: plan.phases,
+            resume_color: match self.glass_resume_format {
+                GlassResumeFormat::F32 => 0,
+                GlassResumeFormat::Unorm16 => 1,
+            },
+            flags: u32::from(self.glass_stops_disabled),
+            capacities: plan.capacities,
+            backdrop_atlas: backdrop_proxy,
+            glass_atlas: glass_proxy,
+        };
+        let (recording, target) = render::render_full_glass(
+            scene,
+            &mut self.resolver,
+            &self.shaders,
+            &mut self.image_atlas,
+            params,
+            &glass,
+        );
+        let (backdrop, backdrop_view) = self.glass_backdrop.as_ref().unwrap();
+        let (glass_atlas, glass_view) = self.glass_atlas.as_ref().unwrap();
+        let external_resources = [
+            ExternalResource::Image(*target.as_image().unwrap(), texture),
+            ExternalResource::Image(backdrop_proxy, backdrop_view),
+            ExternalResource::Image(glass_proxy, glass_view),
+        ];
+        let mut external = ExternalPasses {
+            passes,
+            backdrop,
+            glass: glass_atlas,
+            placements: &plan.placements,
+        };
+        self.engine.run_recording(
+            device,
+            queue,
+            &recording,
+            &external_resources,
+            "render_to_texture_with_glass",
+            #[cfg(feature = "wgpu-profiler")]
+            &mut self.profiler,
+            Some(&mut external),
+        )?;
+        #[cfg(feature = "wgpu-profiler")]
+        {
+            self.profiler.end_frame().unwrap();
+            if let Some(result) = self
+                .profiler
+                .process_finished_frame(queue.get_timestamp_period())
+            {
+                self.profile_result = Some(result);
+            }
+        }
+        Ok(())
+    }
+
+    /// Sets how fine saves its colour state when a tile stops for glass.
+    pub fn set_glass_resume_format(&mut self, format: GlassResumeFormat) {
+        self.glass_resume_format = format;
+    }
+
+    /// Sets the texel format of the glass atlas handed to the glass passes.
+    pub fn set_glass_atlas_format(&mut self, format: GlassAtlasFormat) {
+        self.glass_atlas_format = format;
+    }
+
+    /// Makes glass frames skip every stop, a control for the split tests.
+    #[doc(hidden)]
+    pub fn set_glass_stops_disabled(&mut self, disabled: bool) {
+        self.glass_stops_disabled = disabled;
     }
 
     /// Overwrite `image` with `texture`.
@@ -700,6 +890,7 @@ impl Renderer {
                 "render_to_texture_async debug layers",
                 #[cfg(feature = "wgpu-profiler")]
                 &mut self.profiler,
+                None,
             )?;
         }
 
@@ -751,6 +942,7 @@ impl Renderer {
             "t_async_coarse",
             #[cfg(feature = "wgpu-profiler")]
             &mut self.profiler,
+            None,
         )?;
 
         let mut bump: Option<BumpAllocators> = None;
@@ -777,6 +969,7 @@ impl Renderer {
             "t_async_fine",
             #[cfg(feature = "wgpu-profiler")]
             &mut self.profiler,
+            None,
         )?;
         Ok(RenderResult {
             bump,

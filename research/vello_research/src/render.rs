@@ -3,12 +3,13 @@
 
 //! Take an encoded scene and create a graph to render it
 
-use crate::recording::{BufferProxy, ImageFormat, ImageProxy, Recording, ResourceProxy};
+use crate::recording::{BufferProxy, Command, ImageFormat, ImageProxy, Recording, ResourceProxy};
 use crate::shaders::FullShaders;
 use crate::{AaConfig, RenderParams};
 
 #[cfg(feature = "wgpu")]
 use crate::Scene;
+use crate::glass::GlassMarkerRow;
 
 use vello_encoding::{Encoding, Resolver, WorkgroupSize, make_mask_lut, make_mask_lut_16};
 
@@ -91,6 +92,45 @@ pub(crate) fn render_full(
     render_encoding_full(scene.encoding(), resolver, shaders, image_atlas, params)
 }
 
+/// Size of the glass state's per-frame counters, which are zeroed each frame.
+const GLASS_STATE_HEADER_SIZE: u64 = 32;
+
+/// One frame's glass settings and resources.
+pub(crate) struct GlassRender<'a> {
+    pub(crate) rows: &'a [GlassMarkerRow],
+    pub(crate) phases: u32,
+    pub(crate) resume_color: u32,
+    pub(crate) flags: u32,
+    pub(crate) capacities: [u32; 4],
+    pub(crate) backdrop_atlas: ImageProxy,
+    pub(crate) glass_atlas: ImageProxy,
+}
+
+/// Create a single recording with coarse, glass phase 0 fine, and the external glass phases.
+#[cfg(feature = "wgpu")]
+pub(crate) fn render_full_glass(
+    scene: &Scene,
+    resolver: &mut Resolver,
+    shaders: &FullShaders,
+    image_atlas: &mut Option<ImageProxy>,
+    params: &RenderParams,
+    glass: &GlassRender<'_>,
+) -> (Recording, ResourceProxy) {
+    let mut render = Render::new();
+    let mut recording = render.render_encoding_coarse_inner(
+        scene.encoding(),
+        resolver,
+        shaders,
+        image_atlas,
+        params,
+        false,
+        Some(glass),
+    );
+    let out_image = render.out_image();
+    render.record_fine_inner(shaders, &mut recording, Some(glass));
+    (recording, out_image.into())
+}
+
 #[cfg(feature = "wgpu")]
 /// Create a single recording with both coarse and fine render stages.
 ///
@@ -140,6 +180,27 @@ impl Render {
         persistent_image_atlas: &mut Option<ImageProxy>,
         params: &RenderParams,
         robust: bool,
+    ) -> Recording {
+        self.render_encoding_coarse_inner(
+            encoding,
+            resolver,
+            shaders,
+            persistent_image_atlas,
+            params,
+            robust,
+            None,
+        )
+    }
+
+    fn render_encoding_coarse_inner(
+        &mut self,
+        encoding: &Encoding,
+        resolver: &mut Resolver,
+        shaders: &FullShaders,
+        persistent_image_atlas: &mut Option<ImageProxy>,
+        params: &RenderParams,
+        robust: bool,
+        glass: Option<&GlassRender<'_>>,
     ) -> Recording {
         use vello_encoding::RenderConfig;
         let mut recording = Recording::default();
@@ -201,8 +262,21 @@ impl Render {
         for image in images.images {
             recording.write_image(image_atlas, image.1, image.2, image.0.clone());
         }
-        let cpu_config =
+        let mut cpu_config =
             RenderConfig::new(&layout, params.width, params.height, &params.base_color);
+        if let Some(glass) = glass {
+            let gpu = &mut cpu_config.gpu;
+            gpu.glass_markers = glass.rows.len() as u32;
+            gpu.glass_phases = glass.phases;
+            gpu.glass_resume_color = glass.resume_color;
+            gpu.glass_flags = glass.flags;
+            [
+                gpu.glass_capacity_1,
+                gpu.glass_capacity_2,
+                gpu.glass_capacity_3,
+                gpu.glass_capacity_4,
+            ] = glass.capacities;
+        }
         // HACK: The coarse workgroup counts is the number of active bins.
         if (cpu_config.workgroup_counts.coarse.0
             * cpu_config.workgroup_counts.coarse.1
@@ -558,25 +632,54 @@ impl Render {
 
     /// Run fine rasterization assuming the coarse phase succeeded.
     pub fn record_fine(&mut self, shaders: &FullShaders, recording: &mut Recording) {
+        self.record_fine_inner(shaders, recording, None);
+    }
+
+    /// Run fine rasterization, as glass phase 0 followed by the external phases if `glass` is set.
+    fn record_fine_inner(
+        &mut self,
+        shaders: &FullShaders,
+        recording: &mut Recording,
+        glass: Option<&GlassRender<'_>>,
+    ) {
         let fine_wg_count = self.fine_wg_count.take().unwrap();
         let fine = self.fine_resources.take().unwrap();
+        let glass_bufs = glass.map(|glass| {
+            let markers = recording.upload("vello.glass_markers", bytemuck::cast_slice(glass.rows));
+            let state = BufferProxy::new(GLASS_STATE_HEADER_SIZE, "vello.glass_state");
+            recording.push(Command::Clear(state, 0, Some(GLASS_STATE_HEADER_SIZE)));
+            (markers, state)
+        });
+        let glass_resources = glass.zip(glass_bufs).map(|(glass, (markers, state))| {
+            [
+                ResourceProxy::Buffer(markers),
+                ResourceProxy::Buffer(state),
+                ResourceProxy::Image(glass.backdrop_atlas),
+                ResourceProxy::Image(glass.glass_atlas),
+            ]
+        });
+        let glass_resources = glass_resources.iter().flatten().copied();
         match fine.aa_config {
             AaConfig::Area => {
+                let shader = if glass.is_some() {
+                    shaders.fine_area_glass
+                } else {
+                    shaders.fine_area
+                };
+                let resources = [
+                    fine.config_buf,
+                    fine.segments_buf,
+                    fine.ptcl_buf,
+                    fine.info_bin_data_buf,
+                    fine.blend_spill_buf,
+                    ResourceProxy::Image(fine.out_image),
+                    fine.gradient_image,
+                    fine.image_atlas,
+                ];
                 recording.dispatch(
-                    shaders
-                        .fine_area
-                        .expect("shaders not configured to support AA mode: area"),
+                    shader.expect("shaders not configured to support AA mode: area"),
                     fine_wg_count,
-                    [
-                        fine.config_buf,
-                        fine.segments_buf,
-                        fine.ptcl_buf,
-                        fine.info_bin_data_buf,
-                        fine.blend_spill_buf,
-                        ResourceProxy::Image(fine.out_image),
-                        fine.gradient_image,
-                        fine.image_atlas,
-                    ],
+                    resources.into_iter().chain(glass_resources),
                 );
             }
             _ => {
@@ -589,31 +692,45 @@ impl Render {
                     let buf = recording.upload("vello.mask_lut", mask_lut);
                     self.mask_buf = Some(buf.into());
                 }
-                let fine_shader = match fine.aa_config {
-                    AaConfig::Msaa16 => shaders
+                let fine_shader = match (fine.aa_config, glass.is_some()) {
+                    (AaConfig::Msaa16, false) => shaders
                         .fine_msaa16
                         .expect("shaders not configured to support AA mode: msaa16"),
-                    AaConfig::Msaa8 => shaders
+                    (AaConfig::Msaa8, false) => shaders
                         .fine_msaa8
+                        .expect("shaders not configured to support AA mode: msaa8"),
+                    (AaConfig::Msaa16, true) => shaders
+                        .fine_msaa16_glass
+                        .expect("shaders not configured to support AA mode: msaa16"),
+                    (AaConfig::Msaa8, true) => shaders
+                        .fine_msaa8_glass
                         .expect("shaders not configured to support AA mode: msaa8"),
                     _ => unreachable!(),
                 };
+                let resources = [
+                    fine.config_buf,
+                    fine.segments_buf,
+                    fine.ptcl_buf,
+                    fine.info_bin_data_buf,
+                    fine.blend_spill_buf,
+                    ResourceProxy::Image(fine.out_image),
+                    fine.gradient_image,
+                    fine.image_atlas,
+                    self.mask_buf.unwrap(),
+                ];
                 recording.dispatch(
                     fine_shader,
                     fine_wg_count,
-                    [
-                        fine.config_buf,
-                        fine.segments_buf,
-                        fine.ptcl_buf,
-                        fine.info_bin_data_buf,
-                        fine.blend_spill_buf,
-                        ResourceProxy::Image(fine.out_image),
-                        fine.gradient_image,
-                        fine.image_atlas,
-                        self.mask_buf.unwrap(),
-                    ],
+                    resources.into_iter().chain(glass_resources),
                 );
             }
+        }
+        if let Some((glass, (markers, state))) = glass.zip(glass_bufs) {
+            for phase in 1..=glass.phases {
+                recording.push(Command::External(phase));
+            }
+            recording.free_buffer(markers);
+            recording.free_buffer(state);
         }
         recording.free_resource(fine.config_buf);
         recording.free_resource(fine.tile_buf);

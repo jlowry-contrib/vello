@@ -449,13 +449,31 @@ impl Scene {
     /// Panics if the composite does not lie inside the region.
     pub fn push_glass(&mut self, marker: GlassMarker) {
         match self.encoding.encode_glass(&marker) {
-            Ok(()) | Err(GlassSkip::Empty) => {}
+            Ok(()) => {
+                #[cfg(feature = "bump_estimate")]
+                {
+                    // The region path `encode_glass` encoded, snapped to tiles.
+                    let region = self.encoding.glass.markers.last().unwrap().region;
+                    let rect = Rect::new(
+                        region.x0.into(),
+                        region.y0.into(),
+                        region.x1.into(),
+                        region.y1.into(),
+                    );
+                    self.estimator
+                        .count_path(rect.path_elements(0.1), &Transform::IDENTITY, None);
+                }
+            }
+            Err(GlassSkip::Empty) => {}
             Err(GlassSkip::TooDeep) => log::warn!(
                 "glass.layers.too_deep id={} depth={} max={}",
                 marker.id,
                 self.encoding.n_open_clips,
                 MAX_GLASS_LAYERS
             ),
+            Err(GlassSkip::NonIntegerTransform) => {
+                unreachable!("encode_glass applies no transform")
+            }
         }
     }
 
@@ -464,13 +482,17 @@ impl Scene {
     /// The given transform is applied to every transform in the child.
     /// This is an O(N) operation.
     ///
-    /// # Panics
-    ///
-    /// Panics if the child has glass markers and `transform` is not an integer translation.
+    /// The child's glass markers are left out, and logged, if `transform` is not an integer
+    /// translation.
     pub fn append(&mut self, other: &Self, transform: Option<Affine>) {
         let t = transform.as_ref().map(Transform::from_kurbo);
         let first_marker = self.encoding.glass.len();
-        self.encoding.append(&other.encoding, &t);
+        if let Err(GlassSkip::NonIntegerTransform) = self.encoding.append(&other.encoding, &t) {
+            log::warn!(
+                "glass.append.non_integer markers={}",
+                other.encoding.glass.len()
+            );
+        }
         let glass = &self.encoding.glass;
         for (marker, &depth) in glass.markers[first_marker..]
             .iter()
@@ -1273,5 +1295,35 @@ impl ColorStopsSource for ColorStopsConverter<'_> {
                 offset: item.offset,
             });
         }
+    }
+}
+
+#[cfg(all(test, feature = "bump_estimate"))]
+mod tests {
+    use super::Scene;
+    use vello_encoding::{GlassMarker, IRect};
+
+    #[test]
+    fn push_glass_counts_the_region_path() {
+        let mut scene = Scene::new();
+        let empty = scene.bump_estimate(None);
+        scene.push_glass(GlassMarker {
+            id: 0,
+            region: IRect {
+                x0: 0,
+                y0: 0,
+                x1: 64,
+                y1: 64,
+            },
+            composite: IRect {
+                x0: 16,
+                y0: 16,
+                x1: 48,
+                y1: 48,
+            },
+        });
+        let marked = scene.bump_estimate(None);
+        assert!(marked.lines.len() > empty.lines.len());
+        assert!(marked.segments.len() > empty.segments.len());
     }
 }

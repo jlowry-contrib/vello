@@ -16,6 +16,11 @@ pub const MAX_GLASS_LAYERS: u32 = 8;
 /// Side of a fine tile in pixels, matching `TILE_WIDTH` and `TILE_HEIGHT` in `config.wgsl`.
 pub(crate) const TILE: i32 = 16;
 
+/// Set in a `GLASS` draw object's marker-index word when the frame leaves the marker out:
+/// coarse then writes no glass command for it.
+// Bit 31: marker indices count encoded markers, far below 2^31.
+pub const GLASS_MARKER_SKIP: u32 = 1 << 31;
+
 /// An integer rectangle in device pixels, half-open on its right and bottom edges.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct IRect {
@@ -52,16 +57,25 @@ impl IRect {
 
     /// Grows the rectangle outward to multiples of `step`.
     ///
+    /// An edge whose multiple lies outside `i32` saturates to the outermost multiple inside it.
+    ///
     /// # Panics
     ///
     /// Panics if `step` is not positive.
     pub fn snap_out(self, step: i32) -> Self {
         assert!(step > 0, "snap step must be positive, got {step}");
+        let step = i64::from(step);
+        // The multiples of `step` nearest the `i32` limits, inside them.
+        let lowest = -(-i64::from(i32::MIN)).div_euclid(step) * step;
+        let highest = i64::from(i32::MAX).div_euclid(step) * step;
+        let snap = |v: i64| v.clamp(lowest, highest) as i32;
+        let down = |v: i32| snap(i64::from(v).div_euclid(step) * step);
+        let up = |v: i32| snap(-(-i64::from(v)).div_euclid(step) * step);
         Self {
-            x0: self.x0.div_euclid(step) * step,
-            y0: self.y0.div_euclid(step) * step,
-            x1: -(-self.x1).div_euclid(step) * step,
-            y1: -(-self.y1).div_euclid(step) * step,
+            x0: down(self.x0),
+            y0: down(self.y0),
+            x1: up(self.x1),
+            y1: up(self.y1),
         }
     }
 
@@ -77,13 +91,13 @@ impl IRect {
         }
     }
 
-    /// Moves the rectangle by `(dx, dy)`.
+    /// Moves the rectangle by `(dx, dy)`, saturating each edge at the `i32` limits.
     pub fn translate(self, dx: i32, dy: i32) -> Self {
         Self {
-            x0: self.x0 + dx,
-            y0: self.y0 + dy,
-            x1: self.x1 + dx,
-            y1: self.y1 + dy,
+            x0: self.x0.saturating_add(dx),
+            y0: self.y0.saturating_add(dy),
+            x1: self.x1.saturating_add(dx),
+            y1: self.y1.saturating_add(dy),
         }
     }
 }
@@ -110,13 +124,16 @@ impl GlassMarker {
     }
 }
 
-/// Why [`Encoding::encode_glass`](crate::Encoding::encode_glass) left a marker out.
+/// Why [`Encoding::encode_glass`](crate::Encoding::encode_glass) or
+/// [`Encoding::append`](crate::Encoding::append) left markers out.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum GlassSkip {
     /// The region or composite covers no pixels.
     Empty,
     /// The marker sits under more than [`MAX_GLASS_LAYERS`] open layers.
     TooDeep,
+    /// The appended child's transform is not an integer translation.
+    NonIntegerTransform,
 }
 
 /// The glass markers of an encoding, in paint order.
@@ -157,9 +174,11 @@ impl GlassMarkers {
     ///
     /// `draw_data` must already hold `other`'s draw data at `draw_data_base`.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `other` has markers and `transform` is not an integer translation.
+    /// Returns [`GlassSkip::NonIntegerTransform`] if `other` has markers and `transform` is not
+    /// an integer translation. Their draw objects then carry [`GLASS_MARKER_SKIP`] and an empty
+    /// composite, and none of them is added.
     pub(crate) fn append(
         &mut self,
         other: &Self,
@@ -167,11 +186,17 @@ impl GlassMarkers {
         draw_data_base: usize,
         depth_base: u32,
         transform: Option<&Transform>,
-    ) {
+    ) -> Result<(), GlassSkip> {
         if other.is_empty() {
-            return;
+            return Ok(());
         }
-        let (dx, dy) = transform.map_or((0, 0), integer_translation);
+        let Some((dx, dy)) = transform.map_or(Some((0, 0)), integer_translation) else {
+            for &offset in &other.draw_data_offsets {
+                let offset = offset + draw_data_base;
+                draw_data[offset..offset + 3].copy_from_slice(&[GLASS_MARKER_SKIP, 0, 0]);
+            }
+            return Err(GlassSkip::NonIntegerTransform);
+        };
         let index_base = self.markers.len() as u32;
         for (i, marker) in other.markers.iter().enumerate() {
             let offset = other.draw_data_offsets[i] + draw_data_base;
@@ -187,18 +212,17 @@ impl GlassMarkers {
             draw_data[offset + 2] = max;
             self.push(moved, offset, other.depths[i] + depth_base);
         }
+        Ok(())
     }
 }
 
-fn integer_translation(transform: &Transform) -> (i32, i32) {
+/// Returns the translation of `transform`, if it is a translation by whole pixels.
+fn integer_translation(transform: &Transform) -> Option<(i32, i32)> {
     let [tx, ty] = transform.translation;
     // 2^24 is where f32 stops representing every integer.
     let integral = |v: f32| v.fract() == 0.0 && v.abs() < (1 << 24) as f32;
-    assert!(
-        transform.matrix == Transform::IDENTITY.matrix && integral(tx) && integral(ty),
-        "glass marker in a transformed sub-scene: only integer translations are supported, got {transform:?}"
-    );
-    (tx as i32, ty as i32)
+    (transform.matrix == Transform::IDENTITY.matrix && integral(tx) && integral(ty))
+        .then_some((tx as i32, ty as i32))
 }
 
 /// Packs a tile-aligned composite rectangle into its first and one-past-last tile words.
@@ -273,7 +297,9 @@ pub fn pack_shelves(sizes: &[(u32, u32)], min_width: u32) -> (Vec<(u32, u32)>, (
 
 #[cfg(test)]
 mod tests {
-    use super::{GlassMarker, GlassSkip, IRect, TILE, assign_phases, pack_shelves};
+    use super::{
+        GLASS_MARKER_SKIP, GlassMarker, GlassSkip, IRect, TILE, assign_phases, pack_shelves,
+    };
     use crate::{DrawTag, Encoding, Transform};
 
     fn r((x0, y0, x1, y1): (i32, i32, i32, i32)) -> IRect {
@@ -461,7 +487,7 @@ mod tests {
             matrix: [1.0, 0.0, 0.0, 1.0],
             translation: [16.0, 32.0],
         };
-        a.append(&b, &Some(translate));
+        a.append(&b, &Some(translate)).unwrap();
         assert_eq!(a.glass.markers.len(), 3);
         let words: Vec<_> = (0..3).map(|i| glass_words(&a, i)[0]).collect();
         assert_eq!(words, [0, 1, 2]);
@@ -482,7 +508,7 @@ mod tests {
             matrix: [1.0, 0.0, 0.0, 1.0],
             translation: [8.0, -8.0],
         };
-        a.append(&b, &Some(translate));
+        a.append(&b, &Some(translate)).unwrap();
         assert_eq!(a.glass.markers[0].region, r((0, -16, 48, 32)));
         assert_eq!(a.glass.markers[0].composite, r((0, -16, 32, 16)));
         assert_eq!(glass_words(&a, 0), [0, 0, 2 | 1 << 16]);
@@ -495,35 +521,73 @@ mod tests {
         let mut b = Encoding::new();
         b.n_open_clips = 6;
         b.encode_glass(&m((0, 0, 32, 32), (0, 0, 16, 16))).unwrap();
-        a.append(&b, &None);
+        a.append(&b, &None).unwrap();
         assert_eq!(a.glass.depths, [9]);
         assert_eq!(a.glass.markers[0].region, r((0, 0, 32, 32)));
     }
 
     #[test]
-    #[should_panic(expected = "glass marker in a transformed sub-scene")]
-    fn append_with_a_non_integer_translation_panics() {
+    fn append_under_a_fractional_translation_leaves_markers_out() {
+        let fractional = Transform {
+            matrix: [1.0, 0.0, 0.0, 1.0],
+            translation: [0.5, 0.0],
+        };
+        let scale = Transform {
+            matrix: [2.0, 0.0, 0.0, 2.0],
+            translation: [0.0, 0.0],
+        };
+        for transform in [fractional, scale] {
+            let mut a = Encoding::new();
+            a.encode_glass(&m((0, 0, 32, 32), (0, 0, 16, 16))).unwrap();
+            let mut b = Encoding::new();
+            b.encode_glass(&m((0, 0, 32, 32), (0, 0, 16, 16))).unwrap();
+            b.encode_glass(&m((32, 0, 64, 32), (32, 0, 48, 16)))
+                .unwrap();
+            let result = a.append(&b, &Some(transform));
+            assert_eq!(result, Err(GlassSkip::NonIntegerTransform));
+            // The rest of the child is appended; only its markers are left out.
+            assert_eq!(a.draw_tags.len(), 3);
+            assert_eq!(a.glass.markers.len(), 1);
+            assert_eq!(a.glass.draw_data_offsets, [0]);
+            assert_eq!(glass_words(&a, 0), [0, 0, 1 | 1 << 16]);
+            assert_eq!(
+                a.draw_data[3..],
+                [GLASS_MARKER_SKIP, 0, 0, GLASS_MARKER_SKIP, 0, 0]
+            );
+        }
+    }
+
+    #[test]
+    fn append_under_an_integer_translation_keeps_markers() {
         let mut a = Encoding::new();
         let mut b = Encoding::new();
         b.encode_glass(&m((0, 0, 32, 32), (0, 0, 16, 16))).unwrap();
         let translate = Transform {
             matrix: [1.0, 0.0, 0.0, 1.0],
-            translation: [0.5, 0.0],
+            translation: [-16.0, 48.0],
         };
-        a.append(&b, &Some(translate));
+        assert_eq!(a.append(&b, &Some(translate)), Ok(()));
+        assert_eq!(a.glass.markers.len(), 1);
+        assert_eq!(a.glass.markers[0].region, r((-16, 48, 16, 80)));
+        assert_eq!(glass_words(&a, 0)[0], 0);
     }
 
     #[test]
-    #[should_panic(expected = "glass marker in a transformed sub-scene")]
-    fn append_with_a_scale_panics() {
-        let mut a = Encoding::new();
-        let mut b = Encoding::new();
-        b.encode_glass(&m((0, 0, 32, 32), (0, 0, 16, 16))).unwrap();
-        let scale = Transform {
-            matrix: [2.0, 0.0, 0.0, 2.0],
-            translation: [0.0, 0.0],
-        };
-        a.append(&b, &Some(scale));
+    fn snap_out_saturates_at_the_i32_limits() {
+        let huge = r((i32::MIN, i32::MIN + 1, i32::MAX, i32::MAX - 1)).snap_out(16);
+        assert_eq!(huge, r((i32::MIN, i32::MIN, i32::MAX - 15, i32::MAX - 15)));
+        assert_eq!(r((i32::MIN + 1, 0, 16, 16)).snap_out(TILE).x0, i32::MIN);
+        assert_eq!(
+            r((0, 0, i32::MAX - 20, 16)).snap_out(TILE).x1,
+            i32::MAX - 15
+        );
+        // Steps that don't divide 2^31 saturate inside the limits too.
+        let odd = r((i32::MIN, 0, i32::MAX, 3)).snap_out(3);
+        assert_eq!(odd, r((i32::MIN + 2, 0, i32::MAX - 1, 3)));
+        let moved = r((0, 0, 16, 16)).translate(i32::MAX, i32::MIN);
+        assert_eq!(moved, r((i32::MAX, i32::MIN, i32::MAX, i32::MIN + 16)));
+        let back = r((i32::MIN, i32::MIN, 0, 0)).translate(-1, -1);
+        assert_eq!(back, r((i32::MIN, i32::MIN, -1, -1)));
     }
 
     #[test]

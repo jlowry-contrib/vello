@@ -68,6 +68,10 @@ var<private> cmd_limit: u32;
 // `vello_encoding`.
 const MAX_GLASS_LAYERS = 8u;
 
+// Set in a `GLASS` draw object's marker word for a marker the frame leaves out; mirrors
+// `GLASS_MARKER_SKIP` in `vello_encoding`.
+const GLASS_MARKER_SKIP = 0x80000000u;
+
 // Open layers of this tile, indexed by render blend depth: the BEGIN_CLIP draw object,
 // and the clip coverage a glass marker already wrote (bit set in `open_cached`), which
 // END_CLIP reuses because writing a path consumes its tile's segment count.
@@ -187,10 +191,12 @@ fn write_glass_cmd(cmd: u32, marker: u32) {
 }
 
 // Writes a glass marker's commands for tile (x, y): the flattened backdrop of the open
-// layers, the snapshot and, unless the tile is clipped away, the stop and composite.
+// layers, the snapshot and, unless the tile is clipped away, the stop and composite. A
+// marker the frame leaves out gets none.
 fn write_glass(dd: u32, x: u32, y: u32, depth: u32, clip_zero: bool) {
-    // `Scene::append` can nest a marker deeper than `push_glass` checked.
-    if config.glass_phases == 0u || depth > MAX_GLASS_LAYERS {
+    // `Scene::append` can nest a marker deeper than `push_glass` checked; the frame leaves
+    // such markers out too, and the depth test is a backstop.
+    if config.glass_phases == 0u || depth > MAX_GLASS_LAYERS || (scene[dd] & GLASS_MARKER_SKIP) != 0u {
         return;
     }
     glass_tile = true;

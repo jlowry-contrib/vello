@@ -96,10 +96,12 @@ impl Encoding {
 
     /// Appends another encoding to this one with an optional transform.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `other` has glass markers and `transform` is not an integer translation.
-    pub fn append(&mut self, other: &Self, transform: &Option<Transform>) {
+    /// Returns [`GlassSkip::NonIntegerTransform`] if `other` has glass markers and
+    /// `transform` is not an integer translation. Everything else is still appended; those
+    /// markers are left out.
+    pub fn append(&mut self, other: &Self, transform: &Option<Transform>) -> Result<(), GlassSkip> {
         let draw_data_base = self.draw_data.len();
         let depth_base = self.n_open_clips;
         let glyph_runs_base = {
@@ -166,7 +168,7 @@ impl Encoding {
         self.path_data.extend_from_slice(&other.path_data);
         self.draw_tags.extend_from_slice(&other.draw_tags);
         self.draw_data.extend_from_slice(&other.draw_data);
-        self.glass.append(
+        let glass = self.glass.append(
             &other.glass,
             &mut self.draw_data,
             draw_data_base,
@@ -188,6 +190,7 @@ impl Encoding {
             self.transforms.extend_from_slice(&other.transforms);
         }
         self.styles.extend_from_slice(&other.styles);
+        glass
     }
 
     /// Returns a snapshot of the current stream offsets.

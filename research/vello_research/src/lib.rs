@@ -460,12 +460,11 @@ fn fit_glass_atlas(
     if current.is_none() {
         *sizer = glass::AtlasSizer::default();
     }
-    let (width, height) = sizer.size(size);
+    let max = device.limits().max_texture_dimension_2d;
+    let (width, height) = sizer
+        .fit(size, max)
+        .map_err(|(width, height)| Error::GlassAtlasTooLarge(width, height, max))?;
     if current != Some((width, height)) {
-        let max = device.limits().max_texture_dimension_2d;
-        if width > max || height > max {
-            return Err(Error::GlassAtlasTooLarge(width, height, max));
-        }
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some(label),
             size: wgpu::Extent3d {
@@ -639,13 +638,15 @@ impl Renderer {
         let state_full = plan.state_full();
         if state_full != self.glass_state_full {
             self.glass_state_full = state_full;
+            let (over_size, over_dispatch) = (plan.over_size, plan.over_dispatch);
+            let (limit, workgroups) = (limits.state_size, limits.workgroups);
             if state_full > 0 {
                 log::warn!(
-                    "glass.state.full left_out={state_full} limit={}",
-                    limits.state_size
+                    "glass.state.full left_out={state_full} over_size={over_size} \
+                     limit={limit} over_dispatch={over_dispatch} workgroups={workgroups}"
                 );
             } else {
-                log::info!("glass.state.full left_out=0 limit={}", limits.state_size);
+                log::info!("glass.state.full left_out=0 limit={limit} workgroups={workgroups}");
             }
         }
         if let (Some(list), _) = self.glass_capacity_for_tests {

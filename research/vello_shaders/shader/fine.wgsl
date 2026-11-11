@@ -82,6 +82,7 @@ const GLASS_STATE_PHASE = 0u;
 const GLASS_STATE_TILES0 = 1u;
 // [2] tiles past capacity: listed past list 0's or stopped past a phase's, which the setups
 // leave out of the dispatches and add here.
+const GLASS_STATE_OVERFLOW = 2u;
 // [3] commands the lite pass ran, counted only in the `lite_counted` permutations (a test).
 const GLASS_STATE_LITE_COMMANDS = 3u;
 // [4 + j - 1] the stop count of phase j.

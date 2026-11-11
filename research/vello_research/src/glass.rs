@@ -94,6 +94,9 @@ pub struct GlassPhase<'a> {
 
 /// Passes that turn backdrops into glass, recorded into Vello's command encoder.
 ///
+/// The atlas textures can be recreated on any frame, as they grow or shrink, so hooks must
+/// not keep atlas textures, views or bind groups from one frame for the next.
+///
 /// The hook is a trait object (M-DI-HIERARCHY) because Vello can't name the types of
 /// the crate that implements the glass passes.
 #[cfg(feature = "wgpu")]
@@ -139,6 +142,10 @@ pub(crate) struct GlassPlan {
     pub(crate) capacities: [u32; MAX_GLASS_PHASES as usize],
     /// Size of each phase's resume records, in words, from the deepest of its markers.
     pub(crate) record_words: [u32; MAX_GLASS_PHASES as usize],
+    /// State-full markers whose records would pass the size limit.
+    pub(crate) over_size: usize,
+    /// State-full markers whose tiles would pass the dispatch limit; a marker can pass both.
+    pub(crate) over_dispatch: usize,
     /// Why the frame leaves out each encoded marker, if it does and the marker has pixels on
     /// the target under at most [`MAX_GLASS_LAYERS`] open layers.
     pub(crate) left_out: Vec<Option<GlassLeftOut>>,
@@ -257,7 +264,9 @@ pub(crate) fn plan(
     let mut list_capacity: u32 = 0;
     let mut capacities = [0_u32; MAX_GLASS_PHASES as usize];
     let mut depths = [0; MAX_GLASS_PHASES as usize];
-    let mut state_full = Vec::new();
+    // Whether the state's limits rejected each included marker.
+    let mut state_full = vec![false; clamped.len()];
+    let (mut over_size, mut over_dispatch) = (0, 0);
     let (phases, capped) = assign_phases_fitting(&clamped, |j, phase| {
         let p = phase as usize - 1;
         let regions = region_tiles + u64::from(tile_count(clamped[j].region));
@@ -268,21 +277,23 @@ pub(crate) fn plan(
         deepest[p] = deepest[p].max(markers.depths[included[j]]);
         let words = deepest.map(|d| glass_record_words(limits.resume_color, d));
         let size = pooled_size(glass_state_size(list, caps, words));
-        let fits =
-            size <= limits.state_size && list <= limits.workgroups && caps[p] <= limits.workgroups;
-        if fits {
+        let fits_size = size <= limits.state_size;
+        let fits_dispatch = list <= limits.workgroups && caps[p] <= limits.workgroups;
+        if fits_size && fits_dispatch {
             (region_tiles, list_capacity, capacities, depths) = (regions, list, caps, deepest);
         } else {
-            state_full.push(j);
+            state_full[j] = true;
+            over_size += usize::from(!fits_size);
+            over_dispatch += usize::from(!fits_dispatch);
         }
-        fits
+        fits_size && fits_dispatch
     });
     if capped > 0 {
         log::warn!("glass.phase.capped markers={capped} max={MAX_GLASS_PHASES}");
     }
     for (j, &phase) in phases.iter().enumerate() {
         if phase == 0 {
-            left_out[included[j]] = Some(if state_full.contains(&j) {
+            left_out[included[j]] = Some(if state_full[j] {
                 GlassLeftOut::StateFull
             } else {
                 GlassLeftOut::PhaseCap
@@ -338,6 +349,8 @@ pub(crate) fn plan(
         list_capacity,
         capacities,
         record_words: depths.map(|d| glass_record_words(limits.resume_color, d)),
+        over_size,
+        over_dispatch,
         left_out,
         left_out_offsets,
     }
@@ -361,10 +374,26 @@ pub(crate) struct AtlasSizer {
 
 #[cfg(feature = "wgpu")]
 impl AtlasSizer {
-    /// Returns the atlas size for a frame that needs `need`.
+    /// Returns the atlas size for a frame that needs `need`, if neither side passes `max`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the size that would pass `max`, leaving the sizer as it was, so a later
+    /// frame that fits isn't held to it.
+    pub(crate) fn fit(&mut self, need: (u32, u32), max: u32) -> Result<(u32, u32), (u32, u32)> {
+        let mut next = *self;
+        let size = next.size(need);
+        if size.0 > max || size.1 > max {
+            return Err(size);
+        }
+        *self = next;
+        Ok(size)
+    }
+
+    /// Returns the atlas size for a frame that needs `need`, with no limit.
     ///
     /// A shrink goes to the smallest power-of-two size that fits every frame of the low run.
-    pub(crate) fn size(&mut self, need: (u32, u32)) -> (u32, u32) {
+    fn size(&mut self, need: (u32, u32)) -> (u32, u32) {
         let area = |(w, h): (u32, u32)| u64::from(w) * u64::from(h);
         let grown = (self.size.0.max(need.0), self.size.1.max(need.1));
         if grown != self.size {
@@ -513,6 +542,7 @@ mod tests {
             assert_eq!(plan.rows[i].phase, 0, "marker {i}");
         }
         assert_eq!(plan.state_full(), 7);
+        assert_eq!((plan.over_size, plan.over_dispatch), (7, 0));
         assert_eq!(plan.capacities, [254, 0, 0, 0]);
         assert_eq!(plan.list_capacity, 254);
         assert_eq!(state_size(&plan), 32 + 254 * 4120);
@@ -535,6 +565,7 @@ mod tests {
         let kept: Vec<_> = plan.placements.iter().map(|p| p.id).collect();
         assert_eq!(kept, [0, 2]);
         assert_eq!(plan.left_out[1], Some(GlassLeftOut::StateFull));
+        assert_eq!((plan.over_size, plan.over_dispatch), (0, 1));
         assert_eq!(plan.list_capacity, 17);
     }
 
@@ -598,6 +629,16 @@ mod tests {
         // The 120th low frame shrinks to the smallest size that fits the whole run.
         assert_eq!(sizer.size((512, 128)), (512, 512));
         assert_eq!(sizer.size((512, 512)), (512, 512));
+    }
+
+    #[test]
+    fn oversized_atlas_frame_leaves_the_sizer_unchanged() {
+        let mut sizer = AtlasSizer::default();
+        assert_eq!(sizer.fit((512, 512), 8192), Ok((512, 512)));
+        assert_eq!(sizer.fit((512, 32768), 8192), Err((512, 32768)));
+        // The next frame that fits gets the atlas it had, not the oversized one.
+        assert_eq!(sizer.fit((512, 256), 8192), Ok((512, 512)));
+        assert_eq!(sizer.fit((1024, 512), 8192), Ok((1024, 512)));
     }
 
     #[test]

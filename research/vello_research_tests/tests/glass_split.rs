@@ -1377,7 +1377,11 @@ fn full_screen_composite_renders_without_a_validation_error() {
     let screen = rect(0, 0, width as i32, height as i32);
     marker(&mut scene, screen, screen);
     close(&mut scene, 2);
+    // Depth-2 records of 1540 words make about 77 MB, which pools to 96 MiB; the old
+    // 2052-word records pooled to 128 MiB and would leave the marker out under this limit.
+    let limit = 96 << 20;
     let mut renderer = gpu_renderer(AaSupport::area_only());
+    renderer.set_glass_state_limit_for_tests(Some(limit));
     let mut capture = CaptureBackdrop::default();
     let error = validation_error(|| {
         render_frame(
@@ -1392,6 +1396,8 @@ fn full_screen_composite_renders_without_a_validation_error() {
     assert!(error.is_none(), "validation error: {error:?}");
     assert_eq!(capture.frame.len(), 1, "the marker was left out");
     assert_eq!(capture.phases, [1]);
+    let state = read_glass_state(&renderer).len() as u64;
+    assert!(state <= limit, "glass_state is {state} bytes, over {limit}");
 }
 
 #[test]
@@ -1483,7 +1489,9 @@ fn state_limit_leaves_markers_out_and_logs_on_change() {
         let ids: Vec<_> = capture.frame.iter().map(|p| p.id).collect();
         assert_eq!(ids, (0..15).collect::<Vec<_>>());
     }
-    let message = format!("glass.state.full left_out=1 limit={limit}");
+    let message = format!(
+        "glass.state.full left_out=1 over_size=1 limit={limit} over_dispatch=0 workgroups=65535"
+    );
     let count = logs
         .0
         .lock()

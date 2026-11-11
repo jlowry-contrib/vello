@@ -62,7 +62,8 @@ pub const DRAW_INFO_FLAGS_FILL_RULE_BIT: u32 = 1;
 
 /// Set in a `GLASS` draw object's info flags, so binning bins it over its own bounding box
 /// rather than the box intersected with its clips. Binning then writes the clip box, in
-/// tiles, into the draw object's second and third info words for coarse.
+/// tiles, into the draw object's second and third info words for coarse. `draw_leaf` sets it
+/// on every `GLASS` draw: binning has no scene binding, so it can't read the draw tag.
 pub const GLASS_UNCLIPPED_BIN: u32 = 1 << 31;
 
 /// Draw object bounding box.

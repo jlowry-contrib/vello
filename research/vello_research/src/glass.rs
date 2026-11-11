@@ -255,7 +255,7 @@ pub(crate) fn plan(
     // holds at most their tiles, and at most the target's.
     let mut region_tiles: u64 = 0;
     let mut list_capacity: u32 = 0;
-    let mut capacities = [0; MAX_GLASS_PHASES as usize];
+    let mut capacities = [0_u32; MAX_GLASS_PHASES as usize];
     let mut depths = [0; MAX_GLASS_PHASES as usize];
     let mut state_full = Vec::new();
     let (phases, capped) = assign_phases_fitting(&clamped, |j, phase| {
@@ -263,7 +263,7 @@ pub(crate) fn plan(
         let regions = region_tiles + u64::from(tile_count(clamped[j].region));
         let list = regions.min(u64::from(target_tiles)) as u32;
         let mut caps = capacities;
-        caps[p] += tile_count(clamped[j].composite);
+        caps[p] = caps[p].saturating_add(tile_count(clamped[j].composite));
         let mut deepest = depths;
         deepest[p] = deepest[p].max(markers.depths[included[j]]);
         let words = deepest.map(|d| glass_record_words(limits.resume_color, d));

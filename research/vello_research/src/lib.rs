@@ -623,9 +623,11 @@ impl Renderer {
         let markers = &scene.encoding().glass;
         let device_limits = device.limits();
         let limits = glass::GlassLimits {
+            // The shaders index `glass_state` with `u32` words.
             state_size: device_limits
                 .max_storage_buffer_binding_size
                 .min(device_limits.max_buffer_size)
+                .min(4 * u64::from(u32::MAX))
                 .min(self.glass_state_limit_for_tests.unwrap_or(u64::MAX)),
             workgroups: device_limits.max_compute_workgroups_per_dimension,
             resume_color: match self.glass_resume_format {

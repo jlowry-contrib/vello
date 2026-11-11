@@ -339,7 +339,9 @@ pub struct Renderer {
     /// Built on the first glass frame, so renderers that draw no glass never compile them.
     glass_shaders: Option<shaders::GlassShaders>,
     glass_backdrop: Option<(wgpu::Texture, TextureView)>,
+    glass_backdrop_sizer: glass::AtlasSizer,
     glass_atlas: Option<(wgpu::Texture, TextureView)>,
+    glass_atlas_sizer: glass::AtlasSizer,
     glass_resume_format: GlassResumeFormat,
     glass_atlas_format: GlassAtlasFormat,
     /// Markers the glass state's limits left out of the last glass frame, logged on change.
@@ -437,12 +439,14 @@ impl Default for RendererOptions {
     }
 }
 
-/// Grows a glass atlas to hold `size` (never shrinking it) and returns a proxy for it.
+/// Sizes a glass atlas for a frame that needs `size`, as `sizer` decides, and returns a
+/// proxy for it.
 ///
-/// A format change recreates the atlas.
+/// A format change recreates the atlas at `size`.
 #[cfg(feature = "wgpu")]
-fn grow_glass_atlas(
+fn fit_glass_atlas(
     atlas: &mut Option<(wgpu::Texture, TextureView)>,
+    sizer: &mut glass::AtlasSizer,
     device: &Device,
     label: &'static str,
     format: recording::ImageFormat,
@@ -453,7 +457,10 @@ fn grow_glass_atlas(
         .as_ref()
         .filter(|(texture, _)| texture.format() == wgpu_format)
         .map(|(texture, _)| (texture.width(), texture.height()));
-    let (width, height) = current.map_or(size, |(w, h)| (w.max(size.0), h.max(size.1)));
+    if current.is_none() {
+        *sizer = glass::AtlasSizer::default();
+    }
+    let (width, height) = sizer.size(size);
     if current != Some((width, height)) {
         let max = device.limits().max_texture_dimension_2d;
         if width > max || height > max {
@@ -514,7 +521,9 @@ impl Renderer {
             shaders,
             glass_shaders: None,
             glass_backdrop: None,
+            glass_backdrop_sizer: glass::AtlasSizer::default(),
             glass_atlas: None,
+            glass_atlas_sizer: glass::AtlasSizer::default(),
             glass_resume_format: GlassResumeFormat::default(),
             glass_atlas_format: GlassAtlasFormat::default(),
             glass_state_full: 0,
@@ -668,15 +677,17 @@ impl Renderer {
             GlassAtlasFormat::Rgba16Float => recording::ImageFormat::Rgba16Float,
             GlassAtlasFormat::Rgba8Unorm => recording::ImageFormat::Rgba8,
         };
-        let backdrop_proxy = grow_glass_atlas(
+        let backdrop_proxy = fit_glass_atlas(
             &mut self.glass_backdrop,
+            &mut self.glass_backdrop_sizer,
             device,
             "vello.glass_backdrop",
             recording::ImageFormat::Rgba8,
             plan.backdrop_size,
         )?;
-        let glass_proxy = grow_glass_atlas(
+        let glass_proxy = fit_glass_atlas(
             &mut self.glass_atlas,
+            &mut self.glass_atlas_sizer,
             device,
             "vello.glass_atlas",
             glass_format,

@@ -182,9 +182,10 @@ pub(crate) fn phase_placements(placements: &[MarkerPlacement], index: u32) -> &[
 /// with a row per encoded marker (at least one, so the table binds), no phase, and 1×1
 /// atlases.
 ///
-/// The atlases only grow and are reused across frames, as is the pooled `glass_state`, so
-/// after an earlier glass frame the forced frame binds those larger resources. Without
-/// markers, fine samples neither atlas and reads only the state header.
+/// The atlases keep their size until a run of small frames shrinks them, and the pooled
+/// `glass_state` is reused, so after an earlier glass frame the forced frame binds those
+/// larger resources. Without markers, fine samples neither atlas and reads only the state
+/// header.
 #[cfg(feature = "wgpu")]
 pub(crate) fn forced_plan(markers: usize) -> GlassPlan {
     GlassPlan {
@@ -342,10 +343,58 @@ pub(crate) fn plan(
     }
 }
 
+/// Frames an atlas must need at most a quarter of its area before it shrinks: 2 s at 60 Hz.
+#[cfg(feature = "wgpu")]
+const ATLAS_SHRINK_FRAMES: u32 = 120;
+
+/// Sizes a glass atlas across frames: it grows at once to what a frame needs, and shrinks
+/// after [`ATLAS_SHRINK_FRAMES`] consecutive frames needing at most a quarter of its area.
+#[cfg(feature = "wgpu")]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AtlasSizer {
+    size: (u32, u32),
+    /// Consecutive frames that needed at most a quarter of the area.
+    low_frames: u32,
+    /// The largest size those frames needed.
+    low_need: (u32, u32),
+}
+
+#[cfg(feature = "wgpu")]
+impl AtlasSizer {
+    /// Returns the atlas size for a frame that needs `need`.
+    ///
+    /// A shrink goes to the smallest power-of-two size that fits every frame of the low run.
+    pub(crate) fn size(&mut self, need: (u32, u32)) -> (u32, u32) {
+        let area = |(w, h): (u32, u32)| u64::from(w) * u64::from(h);
+        let grown = (self.size.0.max(need.0), self.size.1.max(need.1));
+        if grown != self.size {
+            *self = Self {
+                size: grown,
+                ..Self::default()
+            };
+        } else if 4 * area(need) <= area(self.size) {
+            self.low_frames += 1;
+            self.low_need = (self.low_need.0.max(need.0), self.low_need.1.max(need.1));
+            if self.low_frames >= ATLAS_SHRINK_FRAMES {
+                let fit = |v: u32| v.max(1).next_power_of_two();
+                *self = Self {
+                    size: (fit(self.low_need.0), fit(self.low_need.1)),
+                    ..Self::default()
+                };
+            }
+        } else {
+            self.low_frames = 0;
+            self.low_need = (0, 0);
+        }
+        self.size
+    }
+}
+
 #[cfg(all(test, feature = "wgpu"))]
 mod tests {
     use super::{
-        GlassLeftOut, GlassLimits, GlassMarker, GlassMarkers, GlassPlan, IRect, phase_placements,
+        AtlasSizer, GlassLeftOut, GlassLimits, GlassMarker, GlassMarkers, GlassPlan, IRect,
+        phase_placements,
     };
     use crate::render::glass_state_size;
 
@@ -530,6 +579,44 @@ mod tests {
         assert_eq!(plan.left_out[4], Some(GlassLeftOut::PhaseCap));
         assert_eq!(plan.left_out[5], None);
         assert_eq!(plan.left_out_offsets, [12, 15]);
+    }
+
+    #[test]
+    fn atlas_shrinks_after_sustained_low_use() {
+        let mut sizer = AtlasSizer::default();
+        assert_eq!(sizer.size((1024, 512)), (1024, 512));
+        // A frame needing more grows at once, in each dimension.
+        assert_eq!(sizer.size((512, 1024)), (1024, 1024));
+        for frame in 1..120 {
+            let need = if frame % 2 == 0 {
+                (512, 256)
+            } else {
+                (256, 512)
+            };
+            assert_eq!(sizer.size(need), (1024, 1024), "frame {frame}");
+        }
+        // The 120th low frame shrinks to the smallest size that fits the whole run.
+        assert_eq!(sizer.size((512, 128)), (512, 512));
+        assert_eq!(sizer.size((512, 512)), (512, 512));
+    }
+
+    #[test]
+    fn atlas_does_not_shrink_when_use_alternates() {
+        let mut sizer = AtlasSizer::default();
+        for frame in 0..1000 {
+            let need = if frame % 100 == 0 {
+                (1024, 1024)
+            } else {
+                (512, 256)
+            };
+            assert_eq!(sizer.size(need), (1024, 1024), "frame {frame}");
+        }
+        // Just over a quarter of the area is not low use.
+        let mut sizer = AtlasSizer::default();
+        sizer.size((1024, 1024));
+        for _ in 0..200 {
+            assert_eq!(sizer.size((1024, 257)), (1024, 1024));
+        }
     }
 
     #[test]

@@ -53,6 +53,12 @@ struct Config {
     glass_capacity_2: u32,
     glass_capacity_3: u32,
     glass_capacity_4: u32,
+    // Resume record size of each phase, in words; it holds only the blend stack levels the
+    // phase's markers can have open.
+    glass_record_words_1: u32,
+    glass_record_words_2: u32,
+    glass_record_words_3: u32,
+    glass_record_words_4: u32,
 }
 
 // Geometry of tiles and bins

@@ -183,12 +183,12 @@ pub(crate) fn glass_shaders(
     let glass_resume_setup = add(
         "vello.glass_resume_setup",
         shader_source!(shaders, glass_resume_setup),
-        &[Buffer, Buffer],
+        &[Uniform, Buffer, Buffer],
     );
     let glass_start_setup = add(
         "vello.glass_start_setup",
         shader_source!(shaders, glass_start_setup),
-        &[Buffer, Buffer],
+        &[Uniform, Buffer, Buffer],
     );
 
     Ok(GlassShaders {

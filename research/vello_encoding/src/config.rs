@@ -169,6 +169,14 @@ pub struct ConfigUniform {
     pub glass_capacity_3: u32,
     /// Capacity of the phase 4 resume buffer, in stops.
     pub glass_capacity_4: u32,
+    /// Size of a phase 1 resume record, in `u32`s.
+    pub glass_record_words_1: u32,
+    /// Size of a phase 2 resume record, in `u32`s.
+    pub glass_record_words_2: u32,
+    /// Size of a phase 3 resume record, in `u32`s.
+    pub glass_record_words_3: u32,
+    /// Size of a phase 4 resume record, in `u32`s.
+    pub glass_record_words_4: u32,
 }
 
 /// CPU side setup and configuration.

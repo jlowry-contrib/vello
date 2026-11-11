@@ -80,7 +80,8 @@ var<storage> mask_lut: array<u32, 2048u>;
 const GLASS_STATE_PHASE = 0u;
 // [1] the length of list 0, the tiles in which the lite pass met a glass command.
 const GLASS_STATE_TILES0 = 1u;
-// [2] free.
+// [2] tiles past capacity: listed past list 0's or stopped past a phase's, which the setups
+// leave out of the dispatches and add here.
 // [3] commands the lite pass ran, counted only under `GLASS_COUNT_LITE_COMMANDS` (a test).
 const GLASS_STATE_LITE_COMMANDS = 3u;
 // [4 + j - 1] the stop count of phase j.
@@ -151,13 +152,12 @@ const GLASS_RUNNING_PHASE = 0u;
 #endif
 
 // The rest of `glass_state` mirrors `glass_state_size` in `vello`'s `render.rs`.
-// Resume record header: COMPOSITE command index, clip depth, tile index, marker.
+// Resume record header: COMPOSITE command index, clip depth, tile index, marker. The colours
+// and then the register-held blend stack levels the phase needs, 256 words each, follow.
 const GLASS_RECORD_HEADER = 4u;
 // Colour words per stopped tile: four `f32` or two packed `unorm16` pairs per pixel.
 const GLASS_COLOR_WORDS_F32 = 1024u;
 const GLASS_COLOR_WORDS_UNORM16 = 512u;
-// Register-held blend stack words: BLEND_STACK_SPLIT levels of 256 pixels.
-const GLASS_STACK_WORDS = 1024u;
 // `config.glass_flags` bit 0 skips every stop (the split tests' control).
 const GLASS_STOPS_DISABLED = 1u;
 
@@ -204,12 +204,19 @@ fn glass_capacity_before(j: u32) -> u32 {
     return total;
 }
 
-fn glass_color_words() -> u32 {
-    return select(GLASS_COLOR_WORDS_F32, GLASS_COLOR_WORDS_UNORM16, config.glass_resume_color == 1u);
+// Returns the size of a phase `j` resume record, in words.
+fn glass_record_words(j: u32) -> u32 {
+    switch j {
+        case 1u: { return config.glass_record_words_1; }
+        case 2u: { return config.glass_record_words_2; }
+        case 3u: { return config.glass_record_words_3; }
+        case 4u: { return config.glass_record_words_4; }
+        default: { return 0u; }
+    }
 }
 
-fn glass_record_words() -> u32 {
-    return GLASS_RECORD_HEADER + glass_color_words() + GLASS_STACK_WORDS;
+fn glass_color_words() -> u32 {
+    return select(GLASS_COLOR_WORDS_F32, GLASS_COLOR_WORDS_UNORM16, config.glass_resume_color == 1u);
 }
 
 // Returns the first word of phase `j`'s tile list, after list 0.
@@ -219,8 +226,11 @@ fn glass_tiles_base(j: u32) -> u32 {
 
 // Returns the first word of resume record `slot` of phase `j`.
 fn glass_record_base(j: u32, slot: u32) -> u32 {
-    let records = glass_tiles_base(5u);
-    return records + (glass_capacity_before(j) + slot) * glass_record_words();
+    var base = glass_tiles_base(5u);
+    for (var i = 1u; i < j; i += 1u) {
+        base += glass_capacity(i) * glass_record_words(i);
+    }
+    return base + slot * glass_record_words(j);
 }
 
 // The glass arms index `rgba`, `flat` and `area` only with constant indices, one helper call per

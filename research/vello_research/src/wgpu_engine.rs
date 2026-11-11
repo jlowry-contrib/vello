@@ -1016,6 +1016,12 @@ impl BindMap {
 
 const SIZE_CLASS_BITS: u32 = 1;
 
+/// Returns the size of the pooled buffer that holds `size` bytes: bindings cover the whole
+/// buffer, so limits apply to this size.
+pub(crate) fn pooled_size(size: u64) -> u64 {
+    ResourcePool::size_class(size, SIZE_CLASS_BITS)
+}
+
 impl ResourcePool {
     /// Get a buffer from the pool or create one.
     fn get_buf(

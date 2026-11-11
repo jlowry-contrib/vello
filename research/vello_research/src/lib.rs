@@ -342,10 +342,14 @@ pub struct Renderer {
     glass_atlas: Option<(wgpu::Texture, TextureView)>,
     glass_resume_format: GlassResumeFormat,
     glass_atlas_format: GlassAtlasFormat,
+    /// Markers the glass state's limits left out of the last glass frame, logged on change.
+    glass_state_full: usize,
     glass_stops_disabled: bool,
     glass_permutation_forced: bool,
     glass_start_pass_disabled: bool,
     glass_lite_commands_counted: bool,
+    glass_state_limit_for_tests: Option<u64>,
+    glass_capacity_for_tests: (Option<u32>, Option<u32>),
     #[cfg(feature = "debug_layers")]
     debug: debug::DebugRenderer,
     #[cfg(feature = "wgpu-profiler")]
@@ -513,10 +517,13 @@ impl Renderer {
             glass_atlas: None,
             glass_resume_format: GlassResumeFormat::default(),
             glass_atlas_format: GlassAtlasFormat::default(),
+            glass_state_full: 0,
             glass_stops_disabled: false,
             glass_permutation_forced: false,
             glass_start_pass_disabled: false,
             glass_lite_commands_counted: false,
+            glass_state_limit_for_tests: None,
+            glass_capacity_for_tests: (None, None),
             #[cfg(feature = "debug_layers")]
             debug,
             #[cfg(feature = "wgpu-profiler")]
@@ -605,7 +612,37 @@ impl Renderer {
         passes: &mut dyn GlassPasses,
     ) -> Result<()> {
         let markers = &scene.encoding().glass;
-        let mut plan = glass::plan(markers, params.width, params.height);
+        let device_limits = device.limits();
+        let limits = glass::GlassLimits {
+            state_size: device_limits
+                .max_storage_buffer_binding_size
+                .min(device_limits.max_buffer_size)
+                .min(self.glass_state_limit_for_tests.unwrap_or(u64::MAX)),
+            workgroups: device_limits.max_compute_workgroups_per_dimension,
+            resume_color: match self.glass_resume_format {
+                GlassResumeFormat::F32 => 0,
+                GlassResumeFormat::Unorm16 => 1,
+            },
+        };
+        let mut plan = glass::plan(markers, params.width, params.height, limits);
+        let state_full = plan.state_full();
+        if state_full != self.glass_state_full {
+            self.glass_state_full = state_full;
+            if state_full > 0 {
+                log::warn!(
+                    "glass.state.full left_out={state_full} limit={}",
+                    limits.state_size
+                );
+            } else {
+                log::info!("glass.state.full left_out=0 limit={}", limits.state_size);
+            }
+        }
+        if let (Some(list), _) = self.glass_capacity_for_tests {
+            plan.list_capacity = plan.list_capacity.min(list);
+        }
+        if let (_, Some(phase)) = self.glass_capacity_for_tests {
+            plan.capacities = plan.capacities.map(|c| c.min(phase));
+        }
         if plan.placements.is_empty() {
             if !self.glass_permutation_forced {
                 return self.render_to_texture(device, queue, scene, texture, params);
@@ -653,15 +690,14 @@ impl Renderer {
             shaders: glass_shaders,
             rows: &plan.rows,
             phases: plan.phases,
-            resume_color: match self.glass_resume_format {
-                GlassResumeFormat::F32 => 0,
-                GlassResumeFormat::Unorm16 => 1,
-            },
+            resume_color: limits.resume_color,
             // Bit 0 skips every stop; bit 1 counts the lite pass's commands.
             flags: u32::from(self.glass_stops_disabled)
                 | u32::from(self.glass_lite_commands_counted) << 1,
             list_capacity: plan.list_capacity,
             capacities: plan.capacities,
+            record_words: plan.record_words,
+            left_out: &plan.left_out_offsets,
             start_pass: !self.glass_start_pass_disabled,
             backdrop_atlas: backdrop_proxy,
             glass_atlas: glass_proxy,
@@ -795,6 +831,19 @@ impl Renderer {
     #[doc(hidden)]
     pub fn set_glass_lite_commands_counted(&mut self, counted: bool) {
         self.glass_lite_commands_counted = counted;
+    }
+
+    /// Lowers the `glass_state` size limit below the device's, for tests.
+    #[doc(hidden)]
+    pub fn set_glass_state_limit_for_tests(&mut self, limit: Option<u64>) {
+        self.glass_state_limit_for_tests = limit;
+    }
+
+    /// Caps the capacity of list 0 and of each phase below the plan's, for tests; the setups
+    /// then leave the excess out and count it in `glass_state` word 2.
+    #[doc(hidden)]
+    pub fn set_glass_capacity_for_tests(&mut self, list: Option<u32>, phase: Option<u32>) {
+        self.glass_capacity_for_tests = (list, phase);
     }
 
     /// Overwrite `image` with `texture`.

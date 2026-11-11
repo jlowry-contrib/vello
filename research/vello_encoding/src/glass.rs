@@ -248,6 +248,18 @@ pub(crate) fn composite_tile_words(composite: IRect) -> [u32; 2] {
 /// raises no later marker's phase. Returns the phases and how many markers the cap
 /// left out.
 pub fn assign_phases(markers: &[GlassMarker]) -> (Vec<u32>, usize) {
+    assign_phases_fitting(markers, |_, _| true)
+}
+
+/// Assigns phases as [`assign_phases`] does, also leaving out each marker `fits` rejects.
+///
+/// `fits(i, phase)` is called in paint order for each marker within the phase cap. A
+/// rejected marker gets phase 0 and raises no later marker's phase, and later markers are
+/// still tried. Returns the phases and how many markers the cap left out.
+pub fn assign_phases_fitting(
+    markers: &[GlassMarker],
+    mut fits: impl FnMut(usize, u32) -> bool,
+) -> (Vec<u32>, usize) {
     let mut phases: Vec<u32> = Vec::with_capacity(markers.len());
     let mut capped = 0;
     for (i, marker) in markers.iter().enumerate() {
@@ -262,8 +274,10 @@ pub fn assign_phases(markers: &[GlassMarker]) -> (Vec<u32>, usize) {
         if phase > MAX_GLASS_PHASES {
             capped += 1;
             phases.push(0);
-        } else {
+        } else if fits(i, phase) {
             phases.push(phase);
+        } else {
+            phases.push(0);
         }
     }
     (phases, capped)
@@ -298,7 +312,8 @@ pub fn pack_shelves(sizes: &[(u32, u32)], min_width: u32) -> (Vec<(u32, u32)>, (
 #[cfg(test)]
 mod tests {
     use super::{
-        GLASS_MARKER_SKIP, GlassMarker, GlassSkip, IRect, TILE, assign_phases, pack_shelves,
+        GLASS_MARKER_SKIP, GlassMarker, GlassSkip, IRect, TILE, assign_phases,
+        assign_phases_fitting, pack_shelves,
     };
     use crate::{DrawTag, Encoding, Transform};
 
@@ -384,6 +399,23 @@ mod tests {
         // The fifth is left out, so the sixth, which meets only its composite, starts over.
         assert_eq!(phases, [1, 2, 3, 4, 0, 1]);
         assert_eq!(capped, 1);
+    }
+
+    #[test]
+    fn rejected_markers_raise_no_later_phase() {
+        let a = m((0, 0, 64, 64), (16, 16, 48, 48));
+        let b = m((32, 32, 96, 96), (48, 48, 80, 80));
+        let c = m((64, 64, 128, 128), (80, 80, 112, 112));
+        let snapped: Vec<_> = [a, b, c].iter().map(|m| m.snap()).collect();
+        let mut tried = Vec::new();
+        let (phases, capped) = assign_phases_fitting(&snapped, |i, phase| {
+            tried.push((i, phase));
+            i != 1
+        });
+        // b is rejected, so c, which meets only b's composite, takes phase 1.
+        assert_eq!(phases, [1, 0, 1]);
+        assert_eq!(capped, 0);
+        assert_eq!(tried, [(0, 1), (1, 2), (2, 1)]);
     }
 
     #[test]

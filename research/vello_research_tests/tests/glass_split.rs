@@ -14,7 +14,7 @@ use vello::wgpu::{self, CommandEncoder, Device, Queue, util::DeviceExt};
 use vello::{AaConfig, AaSupport, Renderer, Scene};
 use vello_research_tests::glass::{
     Atlas, CaptureBackdrop, NoGlass, background, gpu_renderer, max_delta, read_glass_state,
-    render_frame, render_pair, render_pair_cpu, render_scene,
+    render_frame, render_pair, render_pair_cpu, render_scene, validation_error,
 };
 
 /// How much of a test scene to build.
@@ -1308,4 +1308,231 @@ fn lite_pass_renders_no_command_of_a_flagged_tile() {
             "{aa:?}: the lite pass ran commands of a flagged tile"
         );
     }
+}
+
+/// The four-marker chain of `marker_past_the_phase_cap_draws_nothing`, plus a fifth marker
+/// past the phase cap when `capped`.
+fn chain(capped: bool) -> Scene {
+    let mut scene = Scene::new();
+    background(&mut scene);
+    for i in 0..if capped { 5 } else { 4 } {
+        let o = 64 * i;
+        let region = rect(64 + o, 64 + o, 192 + o, 192 + o);
+        let composite = rect(96 + o, 96 + o, 160 + o, 160 + o);
+        marker_with_id(&mut scene, i as u32, region, composite);
+    }
+    scene
+}
+
+#[test]
+#[cfg_attr(skip_gpu_tests, ignore)]
+fn capped_marker_emits_no_glass_commands() {
+    let header = |capped: bool| {
+        let mut renderer = gpu_renderer(AaSupport::area_only());
+        frame(&mut renderer, &chain(capped), true);
+        glass_state_words(&renderer)[..8].to_vec()
+    };
+    let (four, five) = (header(false), header(true));
+    // The fifth region reaches tiles no other region covers, so any glass command coarse
+    // wrote for the capped marker would add them to list 0, word 1.
+    assert_eq!(
+        five, four,
+        "the capped marker changed the glass state header"
+    );
+    // Four phases ran and each stopped its 16 composite tiles; nothing overflowed.
+    assert_eq!(five[0], 4);
+    assert_eq!(five[2..], [0, 0, 16, 16, 16, 16]);
+}
+
+#[test]
+#[cfg_attr(skip_gpu_tests, ignore)]
+fn resume_setup_clamps_to_capacity() {
+    let scene = sixteen_markers();
+    // Phase 1 stops 256 tiles into a capacity of 200.
+    let mut renderer = gpu_renderer(AaSupport::area_only());
+    renderer.set_glass_capacity_for_tests(None, Some(200));
+    frame(&mut renderer, &scene, true);
+    let words = glass_state_words(&renderer);
+    assert_eq!(words[..5], [1, 576, 56, 0, 256]);
+    // List 0 holds 576 tiles in a capacity of 500; with no stops, only list 0 overflows.
+    let mut renderer = gpu_renderer(AaSupport::area_only());
+    renderer.set_glass_stops_disabled(true);
+    renderer.set_glass_capacity_for_tests(Some(500), None);
+    frame(&mut renderer, &scene, true);
+    let words = glass_state_words(&renderer);
+    assert_eq!(words[..5], [1, 576, 76, 0, 0]);
+}
+
+#[test]
+#[cfg_attr(skip_gpu_tests, ignore)]
+fn full_screen_composite_renders_without_a_validation_error() {
+    // An iPhone 17 Pro Max screen, in pixels.
+    let (width, height) = (1206, 2622);
+    let full = Rect::new(0.0, 0.0, f64::from(width), f64::from(height));
+    let mut scene = Scene::new();
+    background(&mut scene);
+    for alpha in [0.9, 0.8] {
+        layer(&mut scene, alpha, &full);
+    }
+    let screen = rect(0, 0, width as i32, height as i32);
+    marker(&mut scene, screen, screen);
+    close(&mut scene, 2);
+    let mut renderer = gpu_renderer(AaSupport::area_only());
+    let mut capture = CaptureBackdrop::default();
+    let error = validation_error(|| {
+        render_frame(
+            &mut renderer,
+            width,
+            height,
+            AaConfig::Area,
+            &scene,
+            Some(&mut capture),
+        );
+    });
+    assert!(error.is_none(), "validation error: {error:?}");
+    assert_eq!(capture.frame.len(), 1, "the marker was left out");
+    assert_eq!(capture.phases, [1]);
+}
+
+#[test]
+#[cfg_attr(skip_gpu_tests, ignore)]
+fn marker_nested_past_eight_in_clip_zero_tiles_leaves_its_tiles_drawn() {
+    // Nine layers open at the deep marker, but the ninth clips its tiles to nothing, so
+    // coarse sees eight there. The frame leaves the marker out, and coarse must list none
+    // of its tiles: list 0 has room for the shallow marker's only.
+    // The layers cover only the deep marker's area, keeping the blend spill small.
+    let area = Rect::new(192.0, 192.0, 448.0, 448.0);
+    let build = |scene: &mut Scene, marked: bool| {
+        background(scene);
+        for _ in 0..5 {
+            layer(scene, 0.9, &area);
+        }
+        let mut inner = Scene::new();
+        for _ in 0..3 {
+            layer(&mut inner, 0.9, &area);
+        }
+        // Two corner squares: binning keeps the deep marker, inside the clip's bounds, but
+        // the clip covers none of its tiles.
+        let mut corners = Rect::new(192.0, 192.0, 208.0, 208.0).to_path(0.1);
+        corners.extend(Rect::new(432.0, 432.0, 448.0, 448.0).path_elements(0.1));
+        layer(&mut inner, 1.0, &corners);
+        if marked {
+            marker_with_id(
+                &mut inner,
+                9,
+                rect(256, 256, 384, 384),
+                rect(288, 288, 352, 352),
+            );
+        }
+        fill(
+            &mut inner,
+            [10, 10, 10, 255],
+            &Circle::new((200.0, 200.0), 12.0),
+        );
+        close(&mut inner, 4);
+        scene.append(&inner, None);
+        close(scene, 5);
+        if marked {
+            marker_with_id(scene, 1, rect(448, 448, 512, 512), rect(464, 464, 496, 496));
+        }
+    };
+    let mut renderer = gpu_renderer(AaSupport::area_only());
+    let mut unmarked = Scene::new();
+    build(&mut unmarked, false);
+    let stock = render_frame(&mut renderer, 512, 512, AaConfig::Area, &unmarked, None);
+    let mut marked = Scene::new();
+    build(&mut marked, true);
+    let split = render_frame(
+        &mut renderer,
+        512,
+        512,
+        AaConfig::Area,
+        &marked,
+        Some(&mut NoGlass),
+    );
+    let words = glass_state_words(&renderer);
+    assert_ne!(stock[..4], [0; 4], "the stock render failed");
+    assert_eq!(
+        words[1..3],
+        [16, 0],
+        "list 0 holds tiles past the shallow marker's"
+    );
+    assert_eq!(max_delta(&stock, &split), 0, "split output differs");
+}
+
+#[test]
+#[cfg_attr(skip_gpu_tests, ignore)]
+fn state_limit_leaves_markers_out_and_logs_on_change() {
+    let logs = capture_logs();
+    // Each of the sixteen markers needs 36 list 0 words and 16 depth-0 `F32` records of
+    // 1029 words with their list words, 66000 bytes; 1 MiB holds fifteen.
+    let limit = 1 << 20;
+    let mut renderer = gpu_renderer(AaSupport::area_only());
+    renderer.set_glass_state_limit_for_tests(Some(limit));
+    let scene = sixteen_markers();
+    for _ in 0..2 {
+        let mut capture = CaptureBackdrop::default();
+        render_frame(
+            &mut renderer,
+            512,
+            512,
+            AaConfig::Area,
+            &scene,
+            Some(&mut capture),
+        );
+        let ids: Vec<_> = capture.frame.iter().map(|p| p.id).collect();
+        assert_eq!(ids, (0..15).collect::<Vec<_>>());
+    }
+    let message = format!("glass.state.full left_out=1 limit={limit}");
+    let count = logs
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|m| **m == message)
+        .count();
+    assert_eq!(
+        count, 1,
+        "`{message}` should be logged once, when the count changes"
+    );
+}
+
+#[test]
+#[cfg_attr(skip_gpu_tests, ignore)]
+fn append_under_a_fractional_translation_logs_and_draws_no_glass() {
+    let logs = capture_logs();
+    let mut child = Scene::new();
+    marker_with_id(&mut child, 7, REGION, COMPOSITE);
+    marker_with_id(
+        &mut child,
+        8,
+        rect(400, 400, 480, 480),
+        rect(416, 416, 464, 464),
+    );
+    let mut scene = Scene::new();
+    background(&mut scene);
+    scene.append(&child, Some(Affine::translate((0.5, 0.0))));
+    assert!(scene.encoding().glass.is_empty());
+    let message = "glass.append.non_integer markers=2".to_owned();
+    assert!(
+        logs.0.lock().unwrap().contains(&message),
+        "missing `{message}`"
+    );
+    let mut unmarked = Scene::new();
+    background(&mut unmarked);
+    let stock = render_scene(512, 512, AaConfig::Area, &unmarked);
+    let mut renderer = gpu_renderer(AaSupport::area_only());
+    let glass = render_frame(
+        &mut renderer,
+        512,
+        512,
+        AaConfig::Area,
+        &scene,
+        Some(&mut NoGlass),
+    );
+    assert_eq!(
+        max_delta(&stock, &glass),
+        0,
+        "the left-out markers changed the output"
+    );
 }

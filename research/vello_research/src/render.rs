@@ -11,7 +11,9 @@ use crate::{AaConfig, RenderParams};
 use crate::Scene;
 use crate::glass::{GlassMarkerRow, MAX_GLASS_PHASES};
 
-use vello_encoding::{Encoding, Resolver, WorkgroupSize, make_mask_lut, make_mask_lut_16};
+use vello_encoding::{
+    Encoding, GLASS_MARKER_SKIP, Resolver, WorkgroupSize, make_mask_lut, make_mask_lut_16,
+};
 
 #[derive(Clone, Copy, Debug)]
 enum AtlasProxyAction {
@@ -93,18 +95,25 @@ pub(crate) fn render_full(
 }
 
 /// Size of `glass_state`'s header, which is zeroed each frame: the running phase, list 0's
-/// length, a free word, the lite pass's test count of commands and the stop count of each
-/// of the four phases, as `u32`s.
+/// length, the count of tiles past capacity, the lite pass's test count of commands and the
+/// stop count of each of the four phases, as `u32`s.
 const GLASS_STATE_HEADER_SIZE: u64 = 32;
 
 /// Words in a resume record's header: command index, clip depth, tile index and marker.
-const GLASS_RECORD_HEADER_WORDS: u64 = 4;
+#[cfg(feature = "wgpu")]
+const GLASS_RECORD_HEADER_WORDS: u32 = 4;
 
 /// Words of a stopped tile's colour: 256 pixels of four `f32`, or of two packed `unorm16` pairs.
-const GLASS_COLOR_WORDS: [u64; 2] = [1024, 512];
+#[cfg(feature = "wgpu")]
+const GLASS_COLOR_WORDS: [u32; 2] = [1024, 512];
 
-/// Words of a stopped tile's register blend stack: `BLEND_STACK_SPLIT` (4) levels of 256 pixels.
-const GLASS_STACK_WORDS: u64 = 1024;
+/// Register-held blend stack levels fine saves at a stop: `BLEND_STACK_SPLIT` in `config.wgsl`.
+#[cfg(feature = "wgpu")]
+const GLASS_STACK_LEVELS: u32 = 4;
+
+/// Words of one saved blend stack level: one packed colour per pixel of a 16×16 tile.
+#[cfg(feature = "wgpu")]
+const GLASS_STACK_LEVEL_WORDS: u32 = 256;
 
 /// Resources the start and resume permutations bind after stock fine's: the marker table,
 /// the glass state, the backdrop atlas and the glass atlas.
@@ -113,16 +122,48 @@ const GLASS_FINE_RESOURCES: usize = 4;
 /// Bytes of one phase's indirect dispatch arguments: `(count_x, 1, 1, pad)`.
 const GLASS_ARGS_SIZE: u64 = 16;
 
-/// Returns the size in bytes of `glass_state` for list 0's and the phases' capacities.
+/// Returns the size in words of a resume record for a phase whose markers sit under at most
+/// `depth` open layers, with `resume_color` 0 for `F32` and 1 for `Unorm16`.
+///
+/// Every record keeps the tile's colour; only the blend stack shrinks with the depth.
+#[cfg(feature = "wgpu")]
+pub(crate) fn glass_record_words(resume_color: u32, depth: u32) -> u32 {
+    GLASS_RECORD_HEADER_WORDS
+        + GLASS_COLOR_WORDS[resume_color as usize]
+        + depth.min(GLASS_STACK_LEVELS) * GLASS_STACK_LEVEL_WORDS
+}
+
+/// Returns the size in bytes of `glass_state` for list 0's and the phases' capacities, with
+/// each phase's records `record_words` long.
 ///
 /// The layout, in `u32` words, mirrors `fine.wgsl`: the 8-word header, then list 0
 /// (`list_capacity` words), then each phase's tile list (`capacity` words), then each
 /// phase's resume records (`capacity` records).
-fn glass_state_size(list_capacity: u32, capacities: [u32; 4], resume_color: u32) -> u64 {
-    let tiles: u64 = capacities.iter().map(|&c| u64::from(c)).sum();
-    let record =
-        GLASS_RECORD_HEADER_WORDS + GLASS_COLOR_WORDS[resume_color as usize] + GLASS_STACK_WORDS;
-    GLASS_STATE_HEADER_SIZE + 4 * u64::from(list_capacity) + 4 * tiles * (1 + record)
+pub(crate) fn glass_state_size(
+    list_capacity: u32,
+    capacities: [u32; 4],
+    record_words: [u32; 4],
+) -> u64 {
+    let per_phase: u64 = capacities
+        .iter()
+        .zip(record_words)
+        .map(|(&c, words)| u64::from(c) * (1 + u64::from(words)))
+        .sum();
+    GLASS_STATE_HEADER_SIZE + 4 * u64::from(list_capacity) + 4 * per_phase
+}
+
+/// Sets [`GLASS_MARKER_SKIP`] and an empty composite in each left-out `GLASS` object of the
+/// packed scene, whose draw data starts at word `draw_data_base`.
+///
+/// The resolver copies the glass words unchanged, at their offsets in the encoding.
+fn skip_glass_markers(packed: &mut [u8], draw_data_base: u32, left_out: &[usize]) {
+    for &offset in left_out {
+        let at = 4 * (draw_data_base as usize + offset);
+        let words = &mut packed[at..at + 12];
+        let index = u32::from_ne_bytes(words[..4].try_into().unwrap());
+        words[..4].copy_from_slice(&(index | GLASS_MARKER_SKIP).to_ne_bytes());
+        words[4..].fill(0);
+    }
 }
 
 /// One frame's glass settings and resources.
@@ -135,6 +176,11 @@ pub(crate) struct GlassRender<'a> {
     /// Most tiles with glass commands, the capacity of list 0.
     pub(crate) list_capacity: u32,
     pub(crate) capacities: [u32; 4],
+    /// Size of each phase's resume records, in words.
+    pub(crate) record_words: [u32; 4],
+    /// Draw data offsets of the `GLASS` objects the frame leaves out, whose words packing
+    /// rewrites so coarse skips them.
+    pub(crate) left_out: &'a [usize],
     /// Whether phase 0 runs the start pass and the later phases run; off only in tests.
     pub(crate) start_pass: bool,
     pub(crate) backdrop_atlas: ImageProxy,
@@ -242,6 +288,9 @@ impl Render {
         let mut packed = vec![];
 
         let (layout, ramps, images) = resolver.resolve(encoding, &mut packed);
+        if let Some(glass) = glass {
+            skip_glass_markers(&mut packed, layout.draw_data_base, glass.left_out);
+        }
         let gradient_image = if ramps.height == 0 {
             ResourceProxy::new_image(1, 1, ImageFormat::Rgba8)
         } else {
@@ -312,6 +361,12 @@ impl Render {
                 gpu.glass_capacity_3,
                 gpu.glass_capacity_4,
             ] = glass.capacities;
+            [
+                gpu.glass_record_words_1,
+                gpu.glass_record_words_2,
+                gpu.glass_record_words_3,
+                gpu.glass_record_words_4,
+            ] = glass.record_words;
         }
         // HACK: The coarse workgroup counts is the number of active bins.
         if (cpu_config.workgroup_counts.coarse.0
@@ -687,7 +742,7 @@ impl Render {
         let glass_bufs = glass.map(|glass| {
             let markers = recording.upload("vello.glass_markers", bytemuck::cast_slice(glass.rows));
             let state = BufferProxy::new(
-                glass_state_size(glass.list_capacity, glass.capacities, glass.resume_color),
+                glass_state_size(glass.list_capacity, glass.capacities, glass.record_words),
                 "vello.glass_state",
             );
             recording.push(Command::Clear(state, 0, Some(GLASS_STATE_HEADER_SIZE)));
@@ -805,11 +860,12 @@ impl Render {
                 u64::from(MAX_GLASS_PHASES + 1) * GLASS_ARGS_SIZE,
                 "vello.glass_args",
             );
-            recording.dispatch(
-                glass.shaders.glass_start_setup,
-                (1, 1, 1),
-                [ResourceProxy::Buffer(state), ResourceProxy::Buffer(args)],
-            );
+            let setup_resources = [
+                fine.config_buf,
+                ResourceProxy::Buffer(state),
+                ResourceProxy::Buffer(args),
+            ];
+            recording.dispatch(glass.shaders.glass_start_setup, (1, 1, 1), setup_resources);
             recording.dispatch_indirect(
                 start_shader,
                 args,
@@ -818,11 +874,7 @@ impl Render {
             );
             for phase in 1..=glass.phases {
                 recording.push(Command::External(phase));
-                recording.dispatch(
-                    glass.shaders.glass_resume_setup,
-                    (1, 1, 1),
-                    [ResourceProxy::Buffer(state), ResourceProxy::Buffer(args)],
-                );
+                recording.dispatch(glass.shaders.glass_resume_setup, (1, 1, 1), setup_resources);
                 recording.dispatch_indirect(
                     resume_shader,
                     args,

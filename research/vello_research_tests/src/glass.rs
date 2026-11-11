@@ -280,6 +280,14 @@ pub fn render_frame(
     read_texture(device, queue, &target)
 }
 
+/// Runs `f` and returns the first validation error it raised on the shared test device.
+pub fn validation_error(f: impl FnOnce()) -> Option<wgpu::Error> {
+    let (device, _) = &*WGPU_DEVICE_QUEUE;
+    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    f();
+    pollster::block_on(scope.pop())
+}
+
 /// Reads back `renderer`'s `glass_state` buffer from its last glass frame.
 pub fn read_glass_state(renderer: &Renderer) -> Vec<u8> {
     let (device, queue) = &*WGPU_DEVICE_QUEUE;

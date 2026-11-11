@@ -181,6 +181,56 @@ fn glass_record_base(j: u32, slot: u32) -> u32 {
     let records = GLASS_STATE_TILES + glass_capacity_before(5u);
     return records + (glass_capacity_before(j) + slot) * glass_record_words();
 }
+
+// The glass arms index `rgba`, `flat` and `area` only with constant indices, one helper call per
+// pixel: a runtime index can move those arrays out of registers for the whole kernel.
+const_assert PIXELS_PER_THREAD == 4u;
+
+// Returns the saved colour of pixel `p` of the record whose colours start at `colors`.
+fn glass_load_color(colors: u32, p: u32) -> vec4<f32> {
+    if config.glass_resume_color == 1u {
+        let rg = unpack2x16unorm(atomicLoad(&glass_state[colors + 2u * p]));
+        let ba = unpack2x16unorm(atomicLoad(&glass_state[colors + 2u * p + 1u]));
+        return vec4(rg, ba);
+    }
+    let base = colors + 4u * p;
+    return vec4(
+        bitcast<f32>(atomicLoad(&glass_state[base])),
+        bitcast<f32>(atomicLoad(&glass_state[base + 1u])),
+        bitcast<f32>(atomicLoad(&glass_state[base + 2u])),
+        bitcast<f32>(atomicLoad(&glass_state[base + 3u])),
+    );
+}
+
+// Saves colour `color` of pixel `p` into the record whose colours start at `colors`.
+fn glass_store_color(colors: u32, p: u32, color: vec4<f32>) {
+    if config.glass_resume_color == 1u {
+        atomicStore(&glass_state[colors + 2u * p], pack2x16unorm(color.xy));
+        atomicStore(&glass_state[colors + 2u * p + 1u], pack2x16unorm(color.zw));
+        return;
+    }
+    let base = colors + 4u * p;
+    atomicStore(&glass_state[base], bitcast<u32>(color.x));
+    atomicStore(&glass_state[base + 1u], bitcast<u32>(color.y));
+    atomicStore(&glass_state[base + 2u], bitcast<u32>(color.z));
+    atomicStore(&glass_state[base + 3u], bitcast<u32>(color.w));
+}
+
+// Writes `color` at `coords` into the backdrop slot at `origin`, if `coords` is in the region.
+fn glass_snapshot_pixel(coords: vec2<u32>, region_min: vec2<u32>, region_max: vec2<u32>, origin: vec2<u32>, color: vec4<f32>) {
+    if all(coords >= region_min) && all(coords < region_max) {
+        textureStore(glass_backdrop, vec2<i32>(origin + coords - region_min), color);
+    }
+}
+
+// Returns `color` under the glass slot at `origin`, if `coords` is in the composite rectangle.
+fn glass_composite_pixel(coords: vec2<u32>, composite_min: vec2<u32>, composite_max: vec2<u32>, origin: vec2<u32>, color: vec4<f32>) -> vec4<f32> {
+    if all(coords >= composite_min) && all(coords < composite_max) {
+        let glass = textureLoad(glass_atlas, vec2<i32>(origin + coords - composite_min), 0);
+        return glass + (1.0 - glass.a) * color;
+    }
+    return color;
+}
 #endif
 
 #ifdef msaa
@@ -1252,20 +1302,18 @@ fn main(
     let colors = record + GLASS_RECORD_HEADER;
     let stack = colors + glass_color_words();
     let first_pixel = local_id.x * PIXELS_PER_THREAD + local_id.y * TILE_WIDTH;
-    for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
-        let p = first_pixel + i;
-        if config.glass_resume_color == 1u {
-            let rg = unpack2x16unorm(atomicLoad(&glass_state[colors + 2u * p]));
-            let ba = unpack2x16unorm(atomicLoad(&glass_state[colors + 2u * p + 1u]));
-            rgba[i] = vec4(rg, ba);
-        } else {
-            for (var c = 0u; c < 4u; c += 1u) {
-                rgba[i][c] = bitcast<f32>(atomicLoad(&glass_state[colors + 4u * p + c]));
-            }
-        }
-        for (var level = 0u; level < min(clip_depth, BLEND_STACK_SPLIT); level += 1u) {
-            blend_stack[level][i] = atomicLoad(&glass_state[stack + TILE_WIDTH * TILE_HEIGHT * level + p]);
-        }
+    rgba[0] = glass_load_color(colors, first_pixel);
+    rgba[1] = glass_load_color(colors, first_pixel + 1u);
+    rgba[2] = glass_load_color(colors, first_pixel + 2u);
+    rgba[3] = glass_load_color(colors, first_pixel + 3u);
+    for (var level = 0u; level < min(clip_depth, BLEND_STACK_SPLIT); level += 1u) {
+        let base = stack + TILE_WIDTH * TILE_HEIGHT * level + first_pixel;
+        blend_stack[level] = array(
+            atomicLoad(&glass_state[base]),
+            atomicLoad(&glass_state[base + 1u]),
+            atomicLoad(&glass_state[base + 2u]),
+            atomicLoad(&glass_state[base + 3u]),
+        );
     }
 #endif
     // main interpretation loop
@@ -1341,21 +1389,21 @@ fn main(
                 let level = ptcl[cmd_ix + 1u];
                 let blend = ptcl[cmd_ix + 2u];
                 let alpha = bitcast<f32>(ptcl[cmd_ix + 3u]);
-                for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
-                    if level + 1u == clip_depth {
-                        flat[i] = rgba[i];
-                    }
-                    var bg_rgba: u32;
-                    if level < BLEND_STACK_SPLIT {
-                        bg_rgba = blend_stack[level][i];
-                    } else {
-                        let blend_in_scratch = level - BLEND_STACK_SPLIT;
-                        let local_tile_ix = local_id.x * PIXELS_PER_THREAD + local_id.y * TILE_WIDTH;
-                        let local_blend_start = blend_offset + blend_in_scratch * TILE_WIDTH * TILE_HEIGHT + local_tile_ix;
-                        bg_rgba = blend_spill[local_blend_start + i];
-                    }
-                    flat[i] = end_clip_mix(unpack4x8unorm(bg_rgba), flat[i], area[i], alpha, blend);
+                var bg: array<u32, PIXELS_PER_THREAD>;
+                if level < BLEND_STACK_SPLIT {
+                    bg = blend_stack[level];
+                } else {
+                    let blend_in_scratch = level - BLEND_STACK_SPLIT;
+                    let local_tile_ix = local_id.x * PIXELS_PER_THREAD + local_id.y * TILE_WIDTH;
+                    let start = blend_offset + blend_in_scratch * TILE_WIDTH * TILE_HEIGHT + local_tile_ix;
+                    bg = array(blend_spill[start], blend_spill[start + 1u], blend_spill[start + 2u], blend_spill[start + 3u]);
                 }
+                // The innermost open level closes the current layer; outer ones close `flat`.
+                let top = level + 1u == clip_depth;
+                flat[0] = end_clip_mix(unpack4x8unorm(bg[0]), select(flat[0], rgba[0], top), area[0], alpha, blend);
+                flat[1] = end_clip_mix(unpack4x8unorm(bg[1]), select(flat[1], rgba[1], top), area[1], alpha, blend);
+                flat[2] = end_clip_mix(unpack4x8unorm(bg[2]), select(flat[2], rgba[2], top), area[2], alpha, blend);
+                flat[3] = end_clip_mix(unpack4x8unorm(bg[3]), select(flat[3], rgba[3], top), area[3], alpha, blend);
                 cmd_ix += 4u;
             }
             case CMD_GLASS_SNAPSHOT: {
@@ -1367,13 +1415,11 @@ fn main(
                     let region_max = min(marker.region.zw * tile_size, vec2(config.target_width, config.target_height));
                     let origin = vec2(marker.backdrop_origin & 0xffffu, marker.backdrop_origin >> 16u);
                     let xy_uint = vec2<u32>(xy);
-                    for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
-                        let coords = xy_uint + vec2(i, 0u);
-                        if all(coords >= region_min) && all(coords < region_max) {
-                            let backdrop = select(flat[i], rgba[i], clip_depth == 0u);
-                            textureStore(glass_backdrop, vec2<i32>(origin + coords - region_min), backdrop);
-                        }
-                    }
+                    let open = clip_depth == 0u;
+                    glass_snapshot_pixel(xy_uint, region_min, region_max, origin, select(flat[0], rgba[0], open));
+                    glass_snapshot_pixel(xy_uint + vec2(1u, 0u), region_min, region_max, origin, select(flat[1], rgba[1], open));
+                    glass_snapshot_pixel(xy_uint + vec2(2u, 0u), region_min, region_max, origin, select(flat[2], rgba[2], open));
+                    glass_snapshot_pixel(xy_uint + vec2(3u, 0u), region_min, region_max, origin, select(flat[3], rgba[3], open));
                 }
                 cmd_ix += 2u;
             }
@@ -1401,19 +1447,17 @@ fn main(
                         let colors = record + GLASS_RECORD_HEADER;
                         let stack = colors + glass_color_words();
                         let first_pixel = local_id.x * PIXELS_PER_THREAD + local_id.y * TILE_WIDTH;
-                        for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
-                            let p = first_pixel + i;
-                            if config.glass_resume_color == 1u {
-                                atomicStore(&glass_state[colors + 2u * p], pack2x16unorm(rgba[i].xy));
-                                atomicStore(&glass_state[colors + 2u * p + 1u], pack2x16unorm(rgba[i].zw));
-                            } else {
-                                for (var c = 0u; c < 4u; c += 1u) {
-                                    atomicStore(&glass_state[colors + 4u * p + c], bitcast<u32>(rgba[i][c]));
-                                }
-                            }
-                            for (var level = 0u; level < min(clip_depth, BLEND_STACK_SPLIT); level += 1u) {
-                                atomicStore(&glass_state[stack + TILE_WIDTH * TILE_HEIGHT * level + p], blend_stack[level][i]);
-                            }
+                        glass_store_color(colors, first_pixel, rgba[0]);
+                        glass_store_color(colors, first_pixel + 1u, rgba[1]);
+                        glass_store_color(colors, first_pixel + 2u, rgba[2]);
+                        glass_store_color(colors, first_pixel + 3u, rgba[3]);
+                        for (var level = 0u; level < min(clip_depth, BLEND_STACK_SPLIT); level += 1u) {
+                            let base = stack + TILE_WIDTH * TILE_HEIGHT * level + first_pixel;
+                            let words = blend_stack[level];
+                            atomicStore(&glass_state[base], words[0]);
+                            atomicStore(&glass_state[base + 1u], words[1]);
+                            atomicStore(&glass_state[base + 2u], words[2]);
+                            atomicStore(&glass_state[base + 3u], words[3]);
                         }
                     }
                     return;
@@ -1429,13 +1473,10 @@ fn main(
                     let composite_max = marker.composite.zw * tile_size;
                     let origin = vec2(marker.glass_origin & 0xffffu, marker.glass_origin >> 16u);
                     let xy_uint = vec2<u32>(xy);
-                    for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
-                        let coords = xy_uint + vec2(i, 0u);
-                        if all(coords >= composite_min) && all(coords < composite_max) {
-                            let glass = textureLoad(glass_atlas, vec2<i32>(origin + coords - composite_min), 0);
-                            rgba[i] = glass + (1.0 - glass.a) * rgba[i];
-                        }
-                    }
+                    rgba[0] = glass_composite_pixel(xy_uint, composite_min, composite_max, origin, rgba[0]);
+                    rgba[1] = glass_composite_pixel(xy_uint + vec2(1u, 0u), composite_min, composite_max, origin, rgba[1]);
+                    rgba[2] = glass_composite_pixel(xy_uint + vec2(2u, 0u), composite_min, composite_max, origin, rgba[2]);
+                    rgba[3] = glass_composite_pixel(xy_uint + vec2(3u, 0u), composite_min, composite_max, origin, rgba[3]);
                 }
                 cmd_ix += 2u;
             }

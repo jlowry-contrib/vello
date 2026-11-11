@@ -9,6 +9,10 @@ const PTCL_INCREMENT = 256u;
 // Amount of space taken by jump
 const PTCL_HEADROOM = 2u;
 
+// Set in a tile's blend offset word, its first, when coarse wrote a glass command for the
+// tile. Blend offsets index `blend_spill`, whose size in words stays far below 2^31.
+const PTCL_GLASS_TILE = 0x80000000u;
+
 // Tags for PTCL commands
 const CMD_END = 0u;
 const CMD_FILL = 1u;

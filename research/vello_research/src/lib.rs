@@ -345,6 +345,7 @@ pub struct Renderer {
     glass_stops_disabled: bool,
     glass_permutation_forced: bool,
     glass_start_pass_disabled: bool,
+    glass_lite_commands_counted: bool,
     #[cfg(feature = "debug_layers")]
     debug: debug::DebugRenderer,
     #[cfg(feature = "wgpu-profiler")]
@@ -515,6 +516,7 @@ impl Renderer {
             glass_stops_disabled: false,
             glass_permutation_forced: false,
             glass_start_pass_disabled: false,
+            glass_lite_commands_counted: false,
             #[cfg(feature = "debug_layers")]
             debug,
             #[cfg(feature = "wgpu-profiler")]
@@ -655,7 +657,9 @@ impl Renderer {
                 GlassResumeFormat::F32 => 0,
                 GlassResumeFormat::Unorm16 => 1,
             },
-            flags: u32::from(self.glass_stops_disabled),
+            // Bit 0 skips every stop; bit 1 counts the lite pass's commands.
+            flags: u32::from(self.glass_stops_disabled)
+                | u32::from(self.glass_lite_commands_counted) << 1,
             list_capacity: plan.list_capacity,
             capacities: plan.capacities,
             start_pass: !self.glass_start_pass_disabled,
@@ -784,6 +788,13 @@ impl Renderer {
     #[doc(hidden)]
     pub fn set_glass_start_pass_disabled(&mut self, disabled: bool) {
         self.glass_start_pass_disabled = disabled;
+    }
+
+    /// Makes glass frames count the commands the lite fine pass runs, in `glass_state`
+    /// word 3, for the split tests.
+    #[doc(hidden)]
+    pub fn set_glass_lite_commands_counted(&mut self, counted: bool) {
+        self.glass_lite_commands_counted = counted;
     }
 
     /// Overwrite `image` with `texture`.

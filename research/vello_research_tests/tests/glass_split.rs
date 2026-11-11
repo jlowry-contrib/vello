@@ -1264,3 +1264,48 @@ fn glass_tile_list_holds_exactly_the_tiles_with_glass_commands() {
         assert_eq!(list, expected, "{aa:?}: the glass tile list differs");
     }
 }
+
+/// Returns the lite pass's command count of `scene`'s glass frame: `glass_state` word 3.
+fn lite_commands(aa: AaConfig, scene: &Scene) -> u32 {
+    let mut renderer = gpu_renderer(AaSupport::all());
+    renderer.set_glass_lite_commands_counted(true);
+    render_frame(&mut renderer, 512, 512, aa, scene, Some(&mut NoGlass));
+    glass_state_words(&renderer)[3]
+}
+
+/// The background, eight squares inside `area`, then the usual marker.
+fn squares_then_marker(area: Option<Rect>) -> Scene {
+    let mut scene = Scene::new();
+    background(&mut scene);
+    if let Some(area) = area {
+        for i in 0..8 {
+            let inset = 4.0 * f64::from(i);
+            let square = area.inset(-inset);
+            fill(&mut scene, [40, 200, 90, 128], &square);
+        }
+    }
+    marker(&mut scene, REGION, COMPOSITE);
+    scene
+}
+
+#[test]
+#[cfg_attr(skip_gpu_tests, ignore)]
+fn lite_pass_renders_no_command_of_a_flagged_tile() {
+    // Squares inside the marker's region add commands only to flagged tiles; squares
+    // outside it add them to tiles the lite pass renders.
+    let inside = Rect::new(112.0, 112.0, 304.0, 208.0);
+    let outside = Rect::new(352.0, 352.0, 496.0, 496.0);
+    for aa in [AaConfig::Area, AaConfig::Msaa16] {
+        let plain = lite_commands(aa, &squares_then_marker(None));
+        let with_inside = lite_commands(aa, &squares_then_marker(Some(inside)));
+        let with_outside = lite_commands(aa, &squares_then_marker(Some(outside)));
+        assert!(
+            with_outside > plain,
+            "{aa:?}: the count missed commands outside the region"
+        );
+        assert_eq!(
+            with_inside, plain,
+            "{aa:?}: the lite pass ran commands of a flagged tile"
+        );
+    }
+}

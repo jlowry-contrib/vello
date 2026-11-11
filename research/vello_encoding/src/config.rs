@@ -157,7 +157,7 @@ pub struct ConfigUniform {
     pub glass_phases: u32,
     /// Format of the saved fine state at a glass stop.
     pub glass_resume_color: u32,
-    /// Glass control flags; bit 0 skips every stop (a test control).
+    /// Glass test controls: bit 0 skips every stop, bit 1 counts the lite pass's commands.
     pub glass_flags: u32,
     /// Capacity of glass tile list 0, the tiles with glass commands, in tiles.
     pub glass_capacity_0: u32,

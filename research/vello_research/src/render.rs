@@ -93,7 +93,8 @@ pub(crate) fn render_full(
 }
 
 /// Size of `glass_state`'s header, which is zeroed each frame: the running phase, list 0's
-/// length, two free words and the stop count of each of the four phases, as `u32`s.
+/// length, a free word, the lite pass's test count of commands and the stop count of each
+/// of the four phases, as `u32`s.
 const GLASS_STATE_HEADER_SIZE: u64 = 32;
 
 /// Words in a resume record's header: command index, clip depth, tile index and marker.

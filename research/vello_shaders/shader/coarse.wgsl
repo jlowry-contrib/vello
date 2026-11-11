@@ -74,6 +74,8 @@ const MAX_GLASS_LAYERS = 8u;
 var<private> open_begin: array<u32, MAX_GLASS_LAYERS>;
 var<private> open_fill: array<vec3<u32>, MAX_GLASS_LAYERS>;
 var<private> open_cached: u32;
+// Whether this tile has a glass command, flagged in its blend offset word for fine.
+var<private> glass_tile: bool;
 
 // Make sure there is space for a command of given size, plus a jump if needed
 fn alloc_cmd(size: u32) {
@@ -191,6 +193,7 @@ fn write_glass(dd: u32, x: u32, y: u32, depth: u32, clip_zero: bool) {
     if config.glass_phases == 0u || depth > MAX_GLASS_LAYERS {
         return;
     }
+    glass_tile = true;
     for (var i = 0u; i < depth; i += 1u) {
         let level = depth - 1u - i;
         let begin = draw_monoids[open_begin[level]];
@@ -554,6 +557,6 @@ fn main(
                 atomicOr(&bump.failed, STAGE_COARSE);
             }
         }
-        ptcl[blend_offset] = blend_ix;
+        ptcl[blend_offset] = select(blend_ix, blend_ix | PTCL_GLASS_TILE, glass_tile);
     }
 }

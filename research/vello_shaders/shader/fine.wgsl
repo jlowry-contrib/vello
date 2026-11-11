@@ -80,7 +80,9 @@ var<storage> mask_lut: array<u32, 2048u>;
 const GLASS_STATE_PHASE = 0u;
 // [1] the length of list 0, the tiles in which the lite pass met a glass command.
 const GLASS_STATE_TILES0 = 1u;
-// [2..4) free.
+// [2] free.
+// [3] commands the lite pass ran, counted only under `GLASS_COUNT_LITE_COMMANDS` (a test).
+const GLASS_STATE_LITE_COMMANDS = 3u;
 // [4 + j - 1] the stop count of phase j.
 const GLASS_STATE_STOPS = 4u;
 // [8..) list 0, then the tile lists of phases 1..4, then their resume records.
@@ -96,6 +98,24 @@ const GLASS_STATE_INDEX: u32 = 8;
 
 @group(0) @binding(GLASS_STATE_INDEX)
 var<storage, read_write> glass_state: array<atomic<u32>>;
+
+// `config.glass_flags` bit 1 counts the commands the lite pass runs (a test).
+const GLASS_COUNT_LITE_COMMANDS = 2u;
+
+// Appends tile `tile_ix` to list 0, for the start pass.
+fn glass_list_tile(tile_ix: u32) {
+    let slot = atomicAdd(&glass_state[GLASS_STATE_TILES0], 1u);
+    if slot < config.glass_capacity_0 {
+        atomicStore(&glass_state[GLASS_STATE_TILES + slot], tile_ix);
+    }
+}
+
+// Adds a tile's `commands` to the test count, if it is on.
+fn glass_count_lite_commands(commands: u32) {
+    if (config.glass_flags & GLASS_COUNT_LITE_COMMANDS) != 0u {
+        atomicAdd(&glass_state[GLASS_STATE_LITE_COMMANDS], commands);
+    }
+}
 #endif
 
 // Glass bindings, after the MSAA mask LUT when there is one.
@@ -1327,7 +1347,25 @@ fn main(
     var flat: array<vec4<f32>, PIXELS_PER_THREAD>;
 #endif
     var cmd_ix = tile_ix * PTCL_INITIAL_ALLOC;
+#ifdef lite
+    let blend_word = ptcl[cmd_ix];
+    if (blend_word & PTCL_GLASS_TILE) != 0u {
+        // Leaves the tile to the start pass before any command: lists it and returns without
+        // output. The word is the same for every thread, so the whole workgroup returns here.
+        if local_id.x == 0u && local_id.y == 0u {
+            glass_list_tile(tile_ix);
+        }
+        return;
+    }
+    let blend_offset = blend_word;
+    var lite_commands = 0u;
+#else
+#ifdef glass
+    let blend_offset = ptcl[cmd_ix] & ~PTCL_GLASS_TILE;
+#else
     let blend_offset = ptcl[cmd_ix];
+#endif
+#endif
     cmd_ix += 1u;
 #ifdef resume
     // Restore the state the tile saved at its stop; levels from BLEND_STACK_SPLIT up stay in
@@ -1358,6 +1396,9 @@ fn main(
         if tag == CMD_END {
             break;
         }
+#ifdef lite
+        lite_commands += 1u;
+#endif
         switch tag {
             case CMD_FILL: {
                 let fill = read_fill(cmd_ix);
@@ -1421,13 +1462,11 @@ fn main(
             }
 #ifdef lite
             case CMD_GLASS_FLATTEN, CMD_GLASS_SNAPSHOT, CMD_GLASS_STOP, CMD_GLASS_COMPOSITE: {
-                // Leaves the tile to the start pass: lists it and returns without output. Every
-                // thread reads the same tag, so the whole workgroup returns here.
+                // Unreached while coarse flags every tile with a glass command; a tile it missed
+                // still goes to the start pass, after the lite pass ran its earlier commands.
                 if local_id.x == 0u && local_id.y == 0u {
-                    let slot = atomicAdd(&glass_state[GLASS_STATE_TILES0], 1u);
-                    if slot < config.glass_capacity_0 {
-                        atomicStore(&glass_state[GLASS_STATE_TILES + slot], tile_ix);
-                    }
+                    glass_count_lite_commands(lite_commands);
+                    glass_list_tile(tile_ix);
                 }
                 return;
             }
@@ -1746,6 +1785,11 @@ fn main(
             default: {}
         }
     }
+#ifdef lite
+    if local_id.x == 0u && local_id.y == 0u {
+        glass_count_lite_commands(lite_commands);
+    }
+#endif
     let xy_uint = vec2<u32>(xy);
     for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
         let coords = xy_uint + vec2(i, 0u);

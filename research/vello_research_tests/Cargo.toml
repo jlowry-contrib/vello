@@ -24,5 +24,8 @@ image = { workspace = true, features = ["png"] }
 scenes = { workspace = true }
 oxipng = { workspace = true, features = ["freestanding", "parallel"] }
 
+[features]
+hot_reload = ["vello/hot_reload"]
+
 [dev-dependencies]
 log = { workspace = true }

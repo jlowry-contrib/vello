@@ -331,18 +331,13 @@ pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
 /// This is an assumption which is known to be limiting, and is planned to change.
 #[cfg(feature = "wgpu")]
 pub struct Renderer {
-    #[cfg_attr(
-        not(feature = "hot_reload"),
-        expect(
-            dead_code,
-            reason = "Options are only used to reinitialise on a hot reload"
-        )
-    )]
     options: RendererOptions,
     engine: WgpuEngine,
     resolver: Resolver,
     image_atlas: Option<recording::ImageProxy>,
     shaders: FullShaders,
+    /// Built on the first glass frame, so renderers that draw no glass never compile them.
+    glass_shaders: Option<shaders::GlassShaders>,
     glass_backdrop: Option<(wgpu::Texture, TextureView)>,
     glass_atlas: Option<(wgpu::Texture, TextureView)>,
     glass_resume_format: GlassResumeFormat,
@@ -510,6 +505,7 @@ impl Renderer {
             resolver: Resolver::new(),
             image_atlas: None,
             shaders,
+            glass_shaders: None,
             glass_backdrop: None,
             glass_atlas: None,
             glass_resume_format: GlassResumeFormat::default(),
@@ -586,7 +582,8 @@ impl Renderer {
     ///
     /// The target is as for [`render_to_texture`](Self::render_to_texture). A scene whose
     /// markers all fall outside the target renders as `render_to_texture` does, as does any
-    /// scene when the CPU stages are in use (logged as `glass.cpu.unsupported`).
+    /// scene when the CPU stages are in use (logged as `glass.cpu.unsupported`). The first
+    /// frame with markers on the target compiles the glass pipelines.
     ///
     /// # Errors
     ///
@@ -609,6 +606,13 @@ impl Renderer {
             log::warn!("glass.cpu.unsupported markers={}", plan.placements.len());
             return self.render_to_texture(device, queue, scene, texture, params);
         }
+        let glass_shaders = match self.glass_shaders.take() {
+            Some(glass_shaders) => glass_shaders,
+            None => {
+                shaders::glass_shaders(device, &mut self.engine, self.options.antialiasing_support)?
+            }
+        };
+        let glass_shaders = self.glass_shaders.insert(glass_shaders);
         let glass_format = match self.glass_atlas_format {
             GlassAtlasFormat::Rgba16Float => recording::ImageFormat::Rgba16Float,
             GlassAtlasFormat::Rgba8Unorm => recording::ImageFormat::Rgba8,
@@ -636,6 +640,7 @@ impl Renderer {
             },
         );
         let glass = render::GlassRender {
+            shaders: glass_shaders,
             rows: &plan.rows,
             phases: plan.phases,
             resume_color: match self.glass_resume_format {
@@ -689,6 +694,18 @@ impl Renderer {
             }
         }
         Ok(())
+    }
+
+    /// Returns whether the glass fine permutations have been built, for tests.
+    #[doc(hidden)]
+    pub fn glass_pipelines_compiled(&self) -> bool {
+        self.glass_shaders.is_some()
+    }
+
+    /// Returns how many shaders the engine holds, for tests.
+    #[doc(hidden)]
+    pub fn shader_count(&self) -> usize {
+        self.engine.shader_count()
     }
 
     /// Sets how fine saves its colour state when a tile stops for glass.
@@ -812,6 +829,7 @@ impl Renderer {
         self.engine = engine;
         self.image_atlas = None;
         self.shaders = shaders;
+        self.glass_shaders = None;
         #[cfg(feature = "debug_layers")]
         {
             self.debug = debug;

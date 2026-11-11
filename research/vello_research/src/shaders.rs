@@ -4,16 +4,172 @@
 //! Load rendering shaders.
 
 #[cfg(feature = "wgpu")]
+use std::borrow::Cow;
+
+#[cfg(feature = "wgpu")]
 use wgpu::Device;
 
 use crate::ShaderId;
 
 #[cfg(feature = "wgpu")]
 use crate::{
-    Error, RendererOptions,
+    AaSupport, Error, RendererOptions,
     recording::{BindType, ImageFormat},
     wgpu_engine::WgpuEngine,
 };
+
+/// Glass fine permutations and the resume setup, built on the first glass frame.
+///
+/// A fine variant is `None` when its AA mode isn't in the renderer's `AaSupport`.
+pub(crate) struct GlassShaders {
+    pub(crate) fine_area_glass: Option<ShaderId>,
+    pub(crate) fine_msaa8_glass: Option<ShaderId>,
+    pub(crate) fine_msaa16_glass: Option<ShaderId>,
+    pub(crate) fine_area_resume: Option<ShaderId>,
+    pub(crate) fine_msaa8_resume: Option<ShaderId>,
+    pub(crate) fine_msaa16_resume: Option<ShaderId>,
+    pub(crate) glass_resume_setup: ShaderId,
+}
+
+/// Returns the shader table: compiled at build time, or from source with `hot_reload`.
+#[cfg(all(feature = "wgpu", feature = "hot_reload"))]
+fn shader_table()
+-> Result<std::collections::HashMap<String, vello_shaders::compile::ShaderInfo>, Error> {
+    Ok(vello_shaders::compile::ShaderInfo::from_default()?)
+}
+
+/// Returns the shader table: compiled at build time, or from source with `hot_reload`.
+#[cfg(all(feature = "wgpu", not(feature = "hot_reload")))]
+fn shader_table() -> Result<vello_shaders::Shaders<'static>, Error> {
+    Ok(vello_shaders::SHADERS)
+}
+
+/// Takes the WGSL source of shader `$name` out of a [`shader_table`].
+#[cfg(feature = "wgpu")]
+macro_rules! shader_source {
+    ($shaders:ident, $name:ident) => {{
+        #[cfg(feature = "hot_reload")]
+        let source = $shaders
+            .remove(stringify!($name))
+            .expect(stringify!($name))
+            .source
+            .into();
+        #[cfg(not(feature = "hot_reload"))]
+        let source = $shaders.$name.wgsl.code;
+        source
+    }};
+}
+
+/// The bindings of the stock fine shaders, ending with the mask LUT that only MSAA uses.
+#[cfg(feature = "wgpu")]
+const FINE_RESOURCES: [BindType; 9] = [
+    BindType::Uniform,
+    BindType::BufReadOnly,
+    BindType::BufReadOnly,
+    BindType::BufReadOnly,
+    BindType::Buffer,
+    BindType::Image(ImageFormat::Rgba8),
+    BindType::ImageRead(ImageFormat::Rgba8),
+    BindType::ImageRead(ImageFormat::Rgba8),
+    // Mask LUT buffer, used only when MSAA is enabled.
+    BindType::BufReadOnly,
+];
+
+/// Builds the glass fine permutations for the AA modes in `aa_support`, and the resume setup.
+#[cfg(feature = "wgpu")]
+pub(crate) fn glass_shaders(
+    device: &Device,
+    engine: &mut WgpuEngine,
+    aa_support: AaSupport,
+) -> Result<GlassShaders, Error> {
+    use crate::wgpu_engine::CpuShaderType;
+    use BindType::*;
+
+    #[cfg_attr(
+        not(feature = "hot_reload"),
+        expect(unused_mut, reason = "only the hot-reload table is consumed")
+    )]
+    let mut shaders = shader_table()?;
+    // Glass needs the GPU stages, so no glass shader has a CPU mirror.
+    let mut add = |label: &'static str, source: Cow<'static, str>, bindings: &[BindType]| {
+        engine.add_compute_shader(device, label, source, bindings, CpuShaderType::Missing)
+    };
+
+    // Marker table, glass state, backdrop atlas and glass atlas, after the mask LUT if any.
+    let glass_resources = [
+        BufReadOnly,
+        Buffer,
+        Image(ImageFormat::Rgba8),
+        ImageRead(ImageFormat::Rgba8),
+    ];
+    let area_resources = &FINE_RESOURCES[..FINE_RESOURCES.len() - 1];
+    let area = [area_resources, &glass_resources].concat();
+    let msaa = [&FINE_RESOURCES[..], &glass_resources].concat();
+
+    let (fine_area_glass, fine_area_resume) = if aa_support.area {
+        (
+            Some(add(
+                "vello.fine_area_glass",
+                shader_source!(shaders, fine_area_glass),
+                &area,
+            )),
+            Some(add(
+                "vello.fine_area_resume",
+                shader_source!(shaders, fine_area_resume),
+                &area,
+            )),
+        )
+    } else {
+        (None, None)
+    };
+    let (fine_msaa8_glass, fine_msaa8_resume) = if aa_support.msaa8 {
+        (
+            Some(add(
+                "vello.fine_msaa8_glass",
+                shader_source!(shaders, fine_msaa8_glass),
+                &msaa,
+            )),
+            Some(add(
+                "vello.fine_msaa8_resume",
+                shader_source!(shaders, fine_msaa8_resume),
+                &msaa,
+            )),
+        )
+    } else {
+        (None, None)
+    };
+    let (fine_msaa16_glass, fine_msaa16_resume) = if aa_support.msaa16 {
+        (
+            Some(add(
+                "vello.fine_msaa16_glass",
+                shader_source!(shaders, fine_msaa16_glass),
+                &msaa,
+            )),
+            Some(add(
+                "vello.fine_msaa16_resume",
+                shader_source!(shaders, fine_msaa16_resume),
+                &msaa,
+            )),
+        )
+    } else {
+        (None, None)
+    };
+    let glass_resume_setup = add(
+        "vello.glass_resume_setup",
+        shader_source!(shaders, glass_resume_setup),
+        &[Buffer, Buffer],
+    );
+
+    Ok(GlassShaders {
+        fine_area_glass,
+        fine_msaa8_glass,
+        fine_msaa16_glass,
+        fine_area_resume,
+        fine_msaa8_resume,
+        fine_msaa16_resume,
+        glass_resume_setup,
+    })
+}
 
 // Shaders for the full pipeline
 pub struct FullShaders {
@@ -39,13 +195,6 @@ pub struct FullShaders {
     pub fine_area: Option<ShaderId>,
     pub fine_msaa8: Option<ShaderId>,
     pub fine_msaa16: Option<ShaderId>,
-    pub fine_area_glass: Option<ShaderId>,
-    pub fine_msaa8_glass: Option<ShaderId>,
-    pub fine_msaa16_glass: Option<ShaderId>,
-    pub fine_area_resume: Option<ShaderId>,
-    pub fine_msaa8_resume: Option<ShaderId>,
-    pub fine_msaa16_resume: Option<ShaderId>,
-    pub glass_resume_setup: ShaderId,
     // 2-level dispatch works for CPU pathtag scan even for large
     // inputs, 3-level is not yet implemented.
     pub pathtag_is_cpu: bool,
@@ -66,24 +215,18 @@ pub(crate) fn full_shaders(
     // if `engine.use_cpu` is specified.
     //let force_gpu_from = Some("binning");
 
-    #[cfg(feature = "hot_reload")]
-    let mut shaders = vello_shaders::compile::ShaderInfo::from_default()?;
-    #[cfg(not(feature = "hot_reload"))]
-    let shaders = vello_shaders::SHADERS;
+    #[cfg_attr(
+        not(feature = "hot_reload"),
+        expect(unused_mut, reason = "only the hot-reload table is consumed")
+    )]
+    let mut shaders = shader_table()?;
 
     macro_rules! add_shader {
         ($name:ident, $label:expr, $bindings:expr, $cpu:expr) => {{
             if force_gpu_from == Some(stringify!($name)) {
                 force_gpu = true;
             }
-            #[cfg(feature = "hot_reload")]
-            let source = shaders
-                .remove(stringify!($name))
-                .expect(stringify!($name))
-                .source
-                .into();
-            #[cfg(not(feature = "hot_reload"))]
-            let source = shaders.$name.wgsl.code;
+            let source = shader_source!(shaders, $name);
             engine.add_compute_shader(
                 device,
                 concat!("vello.", $label),
@@ -211,98 +354,37 @@ pub(crate) fn full_shaders(
             Buffer,
         ]
     );
-    let fine_resources = [
-        Uniform,
-        BufReadOnly,
-        BufReadOnly,
-        BufReadOnly,
-        Buffer,
-        Image(ImageFormat::Rgba8),
-        ImageRead(ImageFormat::Rgba8),
-        ImageRead(ImageFormat::Rgba8),
-        // Mask LUT buffer, used only when MSAA is enabled.
-        BufReadOnly,
-    ];
-
-    // Marker table, glass state, backdrop atlas and glass atlas, after the mask LUT if any.
-    let glass_resources = [
-        BufReadOnly,
-        Buffer,
-        Image(ImageFormat::Rgba8),
-        ImageRead(ImageFormat::Rgba8),
-    ];
+    let fine_resources = FINE_RESOURCES;
     let area_resources = &fine_resources[..fine_resources.len() - 1];
-    let area_glass_resources = [area_resources, &glass_resources].concat();
-    let msaa_glass_resources = [&fine_resources[..], &glass_resources].concat();
 
     let aa_support = &options.antialiasing_support;
-    let (fine_area, fine_area_glass, fine_area_resume) = if aa_support.area {
-        (
-            Some(add_shader!(
-                fine_area,
-                area_resources,
-                CpuShaderType::Missing
-            )),
-            Some(add_shader!(
-                fine_area_glass,
-                area_glass_resources,
-                CpuShaderType::Missing
-            )),
-            Some(add_shader!(
-                fine_area_resume,
-                area_glass_resources,
-                CpuShaderType::Missing
-            )),
-        )
+    let fine_area = if aa_support.area {
+        Some(add_shader!(
+            fine_area,
+            area_resources,
+            CpuShaderType::Missing
+        ))
     } else {
-        (None, None, None)
+        None
     };
-    let (fine_msaa8, fine_msaa8_glass, fine_msaa8_resume) = if aa_support.msaa8 {
-        (
-            Some(add_shader!(
-                fine_msaa8,
-                fine_resources,
-                CpuShaderType::Missing
-            )),
-            Some(add_shader!(
-                fine_msaa8_glass,
-                msaa_glass_resources,
-                CpuShaderType::Missing
-            )),
-            Some(add_shader!(
-                fine_msaa8_resume,
-                msaa_glass_resources,
-                CpuShaderType::Missing
-            )),
-        )
+    let fine_msaa8 = if aa_support.msaa8 {
+        Some(add_shader!(
+            fine_msaa8,
+            fine_resources,
+            CpuShaderType::Missing
+        ))
     } else {
-        (None, None, None)
+        None
     };
-    let (fine_msaa16, fine_msaa16_glass, fine_msaa16_resume) = if aa_support.msaa16 {
-        (
-            Some(add_shader!(
-                fine_msaa16,
-                fine_resources,
-                CpuShaderType::Missing
-            )),
-            Some(add_shader!(
-                fine_msaa16_glass,
-                msaa_glass_resources,
-                CpuShaderType::Missing
-            )),
-            Some(add_shader!(
-                fine_msaa16_resume,
-                msaa_glass_resources,
-                CpuShaderType::Missing
-            )),
-        )
+    let fine_msaa16 = if aa_support.msaa16 {
+        Some(add_shader!(
+            fine_msaa16,
+            fine_resources,
+            CpuShaderType::Missing
+        ))
     } else {
-        (None, None, None)
+        None
     };
-
-    // Glass needs the GPU stages, so the setup has no CPU mirror.
-    let glass_resume_setup =
-        add_shader!(glass_resume_setup, [Buffer, Buffer], CpuShaderType::Missing);
 
     Ok(FullShaders {
         pathtag_reduce,
@@ -327,13 +409,6 @@ pub(crate) fn full_shaders(
         fine_area,
         fine_msaa8,
         fine_msaa16,
-        fine_area_glass,
-        fine_msaa8_glass,
-        fine_msaa16_glass,
-        fine_area_resume,
-        fine_msaa8_resume,
-        fine_msaa16_resume,
-        glass_resume_setup,
         pathtag_is_cpu: options.use_cpu,
     })
 }

@@ -11,10 +11,10 @@ use vello::glass::{
 use vello::kurbo::{Affine, Circle, Rect, Shape};
 use vello::peniko::{Color, Fill, Mix};
 use vello::wgpu::{self, CommandEncoder, Device, Queue, util::DeviceExt};
-use vello::{AaConfig, Renderer, Scene};
+use vello::{AaConfig, AaSupport, Renderer, Scene};
 use vello_research_tests::glass::{
-    Atlas, CaptureBackdrop, NoGlass, background, max_delta, render_pair, render_pair_cpu,
-    render_scene,
+    Atlas, CaptureBackdrop, NoGlass, background, gpu_renderer, max_delta, render_frame,
+    render_pair, render_pair_cpu, render_scene,
 };
 
 /// How much of a test scene to build.
@@ -1010,4 +1010,87 @@ fn cpu_stages_ignore_glass_markers() {
         messages.iter().any(|m| m == warned),
         "missing `{warned}` in {messages:?}"
     );
+}
+
+fn marked_scene() -> Scene {
+    let mut scene = Scene::new();
+    background(&mut scene);
+    marker(&mut scene, REGION, COMPOSITE);
+    after_marker(&mut scene);
+    scene
+}
+
+fn unmarked_scene() -> Scene {
+    let mut scene = Scene::new();
+    background(&mut scene);
+    after_marker(&mut scene);
+    scene
+}
+
+fn frame(renderer: &mut Renderer, scene: &Scene, glass: bool) -> Vec<u8> {
+    let passes: Option<&mut dyn GlassPasses> = if glass { Some(&mut NoGlass) } else { None };
+    render_frame(renderer, 512, 512, AaConfig::Area, scene, passes)
+}
+
+#[test]
+#[cfg_attr(skip_gpu_tests, ignore)]
+fn renderer_new_compiles_no_glass_pipeline() {
+    let renderer = gpu_renderer(AaSupport::all());
+    assert!(!renderer.glass_pipelines_compiled());
+}
+
+#[test]
+#[cfg_attr(skip_gpu_tests, ignore)]
+fn stock_frames_compile_no_glass_pipeline() {
+    let mut renderer = gpu_renderer(AaSupport::all());
+    let scene = unmarked_scene();
+    for _ in 0..3 {
+        frame(&mut renderer, &scene, false);
+    }
+    frame(&mut renderer, &scene, true);
+    assert!(!renderer.glass_pipelines_compiled());
+}
+
+#[test]
+#[cfg_attr(skip_gpu_tests, ignore)]
+fn first_glass_frame_compiles_glass_pipelines_once() {
+    let mut renderer = gpu_renderer(AaSupport::all());
+    let scene = marked_scene();
+    frame(&mut renderer, &scene, true);
+    assert!(renderer.glass_pipelines_compiled());
+    let after_first = renderer.shader_count();
+    frame(&mut renderer, &scene, true);
+    assert_eq!(
+        renderer.shader_count(),
+        after_first,
+        "second frame added shaders"
+    );
+}
+
+#[cfg(feature = "hot_reload")]
+#[test]
+#[cfg_attr(skip_gpu_tests, ignore)]
+fn reload_shaders_resets_glass_pipelines() {
+    let mut renderer = gpu_renderer(AaSupport::all());
+    let scene = marked_scene();
+    let before = frame(&mut renderer, &scene, true);
+    vello_research_tests::glass::reload_shaders(&mut renderer);
+    assert!(!renderer.glass_pipelines_compiled());
+    let after = frame(&mut renderer, &scene, true);
+    assert!(renderer.glass_pipelines_compiled());
+    assert_eq!(
+        max_delta(&before, &after),
+        0,
+        "output changed across the reload"
+    );
+}
+
+#[test]
+#[cfg_attr(skip_gpu_tests, ignore)]
+fn no_marker_scene_is_identical_through_both_entry_points() {
+    let mut renderer = gpu_renderer(AaSupport::all());
+    let scene = unmarked_scene();
+    let stock = frame(&mut renderer, &scene, false);
+    let glass = frame(&mut renderer, &scene, true);
+    assert_eq!(max_delta(&stock, &glass), 0, "entry points differ");
 }

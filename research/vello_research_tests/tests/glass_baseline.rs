@@ -98,10 +98,17 @@ fn read_png(path: &Path) -> Vec<u8> {
 }
 
 #[test]
+#[cfg_attr(skip_gpu_tests, ignore)]
 fn stock_path_matches_the_upstream_baseline() {
     let write = std::env::var_os("GLASS_BASELINE_WRITE").is_some_and(|v| v == "1");
     if write {
         std::fs::create_dir_all("target/glass-baseline").unwrap();
+    } else if !Path::new("target/glass-baseline").is_dir() {
+        eprintln!(
+            "glass.baseline.skipped: target/glass-baseline is absent; regenerate it from \
+             f3000c8 with GLASS_BASELINE_WRITE=1"
+        );
+        return;
     }
     for (name, scene) in baseline_scenes() {
         for (aa, label) in [(AaConfig::Area, "area"), (AaConfig::Msaa16, "msaa16")] {

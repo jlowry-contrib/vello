@@ -4,7 +4,7 @@
 //! Take an encoded scene and create a graph to render it
 
 use crate::recording::{BufferProxy, Command, ImageFormat, ImageProxy, Recording, ResourceProxy};
-use crate::shaders::FullShaders;
+use crate::shaders::{FullShaders, GlassShaders};
 use crate::{AaConfig, RenderParams};
 
 #[cfg(feature = "wgpu")]
@@ -121,6 +121,7 @@ fn glass_state_size(capacities: [u32; 4], resume_color: u32) -> u64 {
 
 /// One frame's glass settings and resources.
 pub(crate) struct GlassRender<'a> {
+    pub(crate) shaders: &'a GlassShaders,
     pub(crate) rows: &'a [GlassMarkerRow],
     pub(crate) phases: u32,
     pub(crate) resume_color: u32,
@@ -691,8 +692,11 @@ impl Render {
         // The shader for phase 0 and, with glass, the shader that resumes stopped tiles.
         let (fine_shader, resume_shader, resources) = match fine.aa_config {
             AaConfig::Area => {
-                let (shader, resume) = if glass.is_some() {
-                    (shaders.fine_area_glass, shaders.fine_area_resume)
+                let (shader, resume) = if let Some(glass) = glass {
+                    (
+                        glass.shaders.fine_area_glass,
+                        glass.shaders.fine_area_resume,
+                    )
                 } else {
                     (shaders.fine_area, None)
                 };
@@ -725,17 +729,19 @@ impl Render {
                     let buf = recording.upload("vello.mask_lut", mask_lut);
                     self.mask_buf = Some(buf.into());
                 }
-                let (fine_shader, resume, mode) = match (fine.aa_config, glass.is_some()) {
-                    (AaConfig::Msaa16, false) => (shaders.fine_msaa16, None, "msaa16"),
-                    (AaConfig::Msaa8, false) => (shaders.fine_msaa8, None, "msaa8"),
-                    (AaConfig::Msaa16, true) => (
-                        shaders.fine_msaa16_glass,
-                        shaders.fine_msaa16_resume,
+                let (fine_shader, resume, mode) = match (fine.aa_config, glass) {
+                    (AaConfig::Msaa16, None) => (shaders.fine_msaa16, None, "msaa16"),
+                    (AaConfig::Msaa8, None) => (shaders.fine_msaa8, None, "msaa8"),
+                    (AaConfig::Msaa16, Some(glass)) => (
+                        glass.shaders.fine_msaa16_glass,
+                        glass.shaders.fine_msaa16_resume,
                         "msaa16",
                     ),
-                    (AaConfig::Msaa8, true) => {
-                        (shaders.fine_msaa8_glass, shaders.fine_msaa8_resume, "msaa8")
-                    }
+                    (AaConfig::Msaa8, Some(glass)) => (
+                        glass.shaders.fine_msaa8_glass,
+                        glass.shaders.fine_msaa8_resume,
+                        "msaa8",
+                    ),
                     _ => unreachable!(),
                 };
                 let fine_shader = fine_shader
@@ -772,7 +778,7 @@ impl Render {
             for phase in 1..=glass.phases {
                 recording.push(Command::External(phase));
                 recording.dispatch(
-                    shaders.glass_resume_setup,
+                    glass.shaders.glass_resume_setup,
                     (1, 1, 1),
                     [ResourceProxy::Buffer(state), ResourceProxy::Buffer(args)],
                 );

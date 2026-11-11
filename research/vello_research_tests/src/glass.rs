@@ -10,7 +10,7 @@ use vello::kurbo::{Affine, Rect};
 use vello::peniko::{Color, Fill, Gradient, color::palette};
 use vello::util::block_on_wgpu;
 use vello::wgpu::{self, CommandEncoder, Device, Queue, Texture};
-use vello::{AaConfig, RenderParams, Renderer, RendererOptions, Scene};
+use vello::{AaConfig, AaSupport, RenderParams, Renderer, RendererOptions, Scene};
 
 use crate::WGPU_DEVICE_QUEUE;
 
@@ -231,17 +231,60 @@ fn pair(
 }
 
 fn renderer(aa: AaConfig, use_cpu: bool) -> Renderer {
+    renderer_with(std::iter::once(aa).collect(), use_cpu)
+}
+
+fn renderer_with(antialiasing_support: AaSupport, use_cpu: bool) -> Renderer {
     let (device, _) = &*WGPU_DEVICE_QUEUE;
     Renderer::new(
         device,
         RendererOptions {
             use_cpu,
             num_init_threads: NonZeroUsize::new(1),
-            antialiasing_support: std::iter::once(aa).collect(),
+            antialiasing_support,
             pipeline_cache: None,
         },
     )
     .unwrap()
+}
+
+/// Creates a GPU renderer on the shared test device for the AA modes in `support`.
+pub fn gpu_renderer(support: AaSupport) -> Renderer {
+    renderer_with(support, false)
+}
+
+/// Renders one frame of `scene` with `renderer` on opaque white and reads it back as RGBA8.
+///
+/// With `passes`, the frame goes through `render_to_texture_with_glass`; without, through
+/// `render_to_texture`.
+pub fn render_frame(
+    renderer: &mut Renderer,
+    width: u32,
+    height: u32,
+    aa: AaConfig,
+    scene: &Scene,
+    passes: Option<&mut dyn GlassPasses>,
+) -> Vec<u8> {
+    let (device, queue) = &*WGPU_DEVICE_QUEUE;
+    let params = params(width, height, aa);
+    let target = target(device, width, height);
+    let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+    match passes {
+        Some(passes) => renderer
+            .render_to_texture_with_glass(device, queue, scene, &view, &params, passes)
+            .unwrap(),
+        None => renderer
+            .render_to_texture(device, queue, scene, &view, &params)
+            .unwrap(),
+    }
+    read_texture(device, queue, &target)
+}
+
+/// Reloads `renderer`'s shaders on the shared test device.
+#[cfg(feature = "hot_reload")]
+pub fn reload_shaders(renderer: &mut Renderer) {
+    let (device, _) = &*WGPU_DEVICE_QUEUE;
+    pollster::block_on(renderer.reload_shaders(device)).unwrap();
 }
 
 fn params(width: u32, height: u32, aa: AaConfig) -> RenderParams {

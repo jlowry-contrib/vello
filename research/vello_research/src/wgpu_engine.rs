@@ -248,6 +248,11 @@ impl WgpuEngine {
         }
     }
 
+    /// Returns how many shaders have been added.
+    pub fn shader_count(&self) -> usize {
+        self.shaders.len()
+    }
+
     /// Add a shader.
     ///
     /// This function is somewhat limited, it doesn't apply a label, only allows one bind group,

@@ -46,6 +46,8 @@ struct Config {
     glass_resume_color: u32,
     // Bit 0 skips every glass stop (a test control).
     glass_flags: u32,
+    // Capacity of list 0, the tiles with glass commands, in tiles.
+    glass_capacity_0: u32,
     // Resume buffer capacity of each phase, in stops.
     glass_capacity_1: u32,
     glass_capacity_2: u32,

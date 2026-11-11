@@ -18,17 +18,21 @@ use crate::{
     wgpu_engine::WgpuEngine,
 };
 
-/// Glass fine permutations and the resume setup, built on the first glass frame.
+/// Glass fine permutations and the dispatch setups, built on the first glass frame.
 ///
 /// A fine variant is `None` when its AA mode isn't in the renderer's `AaSupport`.
 pub(crate) struct GlassShaders {
-    pub(crate) fine_area_glass: Option<ShaderId>,
-    pub(crate) fine_msaa8_glass: Option<ShaderId>,
-    pub(crate) fine_msaa16_glass: Option<ShaderId>,
+    pub(crate) fine_area_lite: Option<ShaderId>,
+    pub(crate) fine_msaa8_lite: Option<ShaderId>,
+    pub(crate) fine_msaa16_lite: Option<ShaderId>,
+    pub(crate) fine_area_start: Option<ShaderId>,
+    pub(crate) fine_msaa8_start: Option<ShaderId>,
+    pub(crate) fine_msaa16_start: Option<ShaderId>,
     pub(crate) fine_area_resume: Option<ShaderId>,
     pub(crate) fine_msaa8_resume: Option<ShaderId>,
     pub(crate) fine_msaa16_resume: Option<ShaderId>,
     pub(crate) glass_resume_setup: ShaderId,
+    pub(crate) glass_start_setup: ShaderId,
 }
 
 /// Returns the shader table: compiled at build time, or from source with `hot_reload`.
@@ -75,7 +79,7 @@ const FINE_RESOURCES: [BindType; 9] = [
     BindType::BufReadOnly,
 ];
 
-/// Builds the glass fine permutations for the AA modes in `aa_support`, and the resume setup.
+/// Builds the glass fine permutations for the AA modes in `aa_support`, and the dispatch setups.
 #[cfg(feature = "wgpu")]
 pub(crate) fn glass_shaders(
     device: &Device,
@@ -106,68 +110,99 @@ pub(crate) fn glass_shaders(
     let area = [area_resources, &glass_resources].concat();
     let msaa = [&FINE_RESOURCES[..], &glass_resources].concat();
 
-    let (fine_area_glass, fine_area_resume) = if aa_support.area {
-        (
-            Some(add(
-                "vello.fine_area_glass",
-                shader_source!(shaders, fine_area_glass),
+    // The lite permutations bind stock fine's resources plus the glass state.
+    let area_lite = [area_resources, &[Buffer]].concat();
+    let msaa_lite = [&FINE_RESOURCES[..], &[Buffer]].concat();
+
+    let [fine_area_lite, fine_area_start, fine_area_resume] = if aa_support.area {
+        [
+            add(
+                "vello.fine_area_lite",
+                shader_source!(shaders, fine_area_lite),
+                &area_lite,
+            ),
+            add(
+                "vello.fine_area_start",
+                shader_source!(shaders, fine_area_start),
                 &area,
-            )),
-            Some(add(
+            ),
+            add(
                 "vello.fine_area_resume",
                 shader_source!(shaders, fine_area_resume),
                 &area,
-            )),
-        )
+            ),
+        ]
+        .map(Some)
     } else {
-        (None, None)
+        [None; 3]
     };
-    let (fine_msaa8_glass, fine_msaa8_resume) = if aa_support.msaa8 {
-        (
-            Some(add(
-                "vello.fine_msaa8_glass",
-                shader_source!(shaders, fine_msaa8_glass),
+    let [fine_msaa8_lite, fine_msaa8_start, fine_msaa8_resume] = if aa_support.msaa8 {
+        [
+            add(
+                "vello.fine_msaa8_lite",
+                shader_source!(shaders, fine_msaa8_lite),
+                &msaa_lite,
+            ),
+            add(
+                "vello.fine_msaa8_start",
+                shader_source!(shaders, fine_msaa8_start),
                 &msaa,
-            )),
-            Some(add(
+            ),
+            add(
                 "vello.fine_msaa8_resume",
                 shader_source!(shaders, fine_msaa8_resume),
                 &msaa,
-            )),
-        )
+            ),
+        ]
+        .map(Some)
     } else {
-        (None, None)
+        [None; 3]
     };
-    let (fine_msaa16_glass, fine_msaa16_resume) = if aa_support.msaa16 {
-        (
-            Some(add(
-                "vello.fine_msaa16_glass",
-                shader_source!(shaders, fine_msaa16_glass),
+    let [fine_msaa16_lite, fine_msaa16_start, fine_msaa16_resume] = if aa_support.msaa16 {
+        [
+            add(
+                "vello.fine_msaa16_lite",
+                shader_source!(shaders, fine_msaa16_lite),
+                &msaa_lite,
+            ),
+            add(
+                "vello.fine_msaa16_start",
+                shader_source!(shaders, fine_msaa16_start),
                 &msaa,
-            )),
-            Some(add(
+            ),
+            add(
                 "vello.fine_msaa16_resume",
                 shader_source!(shaders, fine_msaa16_resume),
                 &msaa,
-            )),
-        )
+            ),
+        ]
+        .map(Some)
     } else {
-        (None, None)
+        [None; 3]
     };
     let glass_resume_setup = add(
         "vello.glass_resume_setup",
         shader_source!(shaders, glass_resume_setup),
         &[Buffer, Buffer],
     );
+    let glass_start_setup = add(
+        "vello.glass_start_setup",
+        shader_source!(shaders, glass_start_setup),
+        &[Buffer, Buffer],
+    );
 
     Ok(GlassShaders {
-        fine_area_glass,
-        fine_msaa8_glass,
-        fine_msaa16_glass,
+        fine_area_lite,
+        fine_msaa8_lite,
+        fine_msaa16_lite,
+        fine_area_start,
+        fine_msaa8_start,
+        fine_msaa16_start,
         fine_area_resume,
         fine_msaa8_resume,
         fine_msaa16_resume,
         glass_resume_setup,
+        glass_start_setup,
     })
 }
 

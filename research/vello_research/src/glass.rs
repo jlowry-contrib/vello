@@ -115,6 +115,9 @@ pub(crate) struct GlassPlan {
     pub(crate) phases: u32,
     pub(crate) backdrop_size: (u32, u32),
     pub(crate) glass_size: (u32, u32),
+    /// Most tiles with glass commands: every encoded marker's region tiles on the target,
+    /// at most the target's tiles.
+    pub(crate) list_capacity: u32,
     /// Most stops each phase can see: its markers' composite tiles.
     pub(crate) capacities: [u32; MAX_GLASS_PHASES as usize],
 }
@@ -169,9 +172,16 @@ pub(crate) fn plan(markers: &GlassMarkers, width: u32, height: u32) -> GlassPlan
     };
     let mut included = Vec::new();
     let mut clamped = Vec::new();
+    // Coarse writes glass commands over the region of every marker at most
+    // `MAX_GLASS_LAYERS` deep, even one this plan leaves out.
+    let mut list_capacity: u32 = 0;
     for (i, (marker, &depth)) in markers.markers.iter().zip(&markers.depths).enumerate() {
         let region = marker.region.clamp(width, height);
         let composite = marker.composite.clamp(width, height);
+        if depth <= MAX_GLASS_LAYERS && !region.is_empty() {
+            let [x0, y0, x1, y1] = tiles(region);
+            list_capacity += (x1 - x0) * (y1 - y0);
+        }
         if depth <= MAX_GLASS_LAYERS && !region.is_empty() && !composite.is_empty() {
             included.push(i);
             clamped.push(GlassMarker {
@@ -232,6 +242,8 @@ pub(crate) fn plan(markers: &GlassMarkers, width: u32, height: u32) -> GlassPlan
         rows,
         backdrop_size,
         glass_size,
+        list_capacity: list_capacity
+            .min(width.div_ceil(TILE as u32) * height.div_ceil(TILE as u32)),
         capacities,
     }
 }

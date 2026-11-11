@@ -344,6 +344,7 @@ pub struct Renderer {
     glass_atlas_format: GlassAtlasFormat,
     glass_stops_disabled: bool,
     glass_permutation_forced: bool,
+    glass_start_pass_disabled: bool,
     #[cfg(feature = "debug_layers")]
     debug: debug::DebugRenderer,
     #[cfg(feature = "wgpu-profiler")]
@@ -513,6 +514,7 @@ impl Renderer {
             glass_atlas_format: GlassAtlasFormat::default(),
             glass_stops_disabled: false,
             glass_permutation_forced: false,
+            glass_start_pass_disabled: false,
             #[cfg(feature = "debug_layers")]
             debug,
             #[cfg(feature = "wgpu-profiler")]
@@ -654,7 +656,9 @@ impl Renderer {
                 GlassResumeFormat::Unorm16 => 1,
             },
             flags: u32::from(self.glass_stops_disabled),
+            list_capacity: plan.list_capacity,
             capacities: plan.capacities,
+            start_pass: !self.glass_start_pass_disabled,
             backdrop_atlas: backdrop_proxy,
             glass_atlas: glass_proxy,
         };
@@ -773,6 +777,13 @@ impl Renderer {
     #[doc(hidden)]
     pub fn set_glass_permutation_forced(&mut self, forced: bool) {
         self.glass_permutation_forced = forced;
+    }
+
+    /// Makes glass frames run only the lite fine pass, which leaves every tile with glass
+    /// commands unwritten, for the split tests.
+    #[doc(hidden)]
+    pub fn set_glass_start_pass_disabled(&mut self, disabled: bool) {
+        self.glass_start_pass_disabled = disabled;
     }
 
     /// Overwrite `image` with `texture`.

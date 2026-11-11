@@ -1126,14 +1126,16 @@ fn glass_state_words(renderer: &Renderer) -> Vec<u32> {
 #[test]
 #[cfg_attr(skip_gpu_tests, ignore)]
 fn glass_state_clear_covers_only_the_header() {
-    // `glass_state`'s header in words: the running phase, padding, four stop counts.
+    // `glass_state`'s header in words: the running phase, list 0's length, two free words,
+    // four stop counts.
     const HEADER_WORDS: usize = 8;
     let mut renderer = gpu_renderer(AaSupport::area_only());
     let scene = sixteen_markers();
     frame(&mut renderer, &scene, true);
     let first = glass_state_words(&renderer);
-    // Phase 1 ran once and stopped 256 tiles: 16 composites of 4 × 4 tiles.
-    assert_eq!(first[..HEADER_WORDS], [1, 0, 0, 0, 256, 0, 0, 0]);
+    // List 0 holds 576 tiles, 16 regions of 6 × 6, and phase 1 ran once and stopped 256
+    // tiles, 16 composites of 4 × 4.
+    assert_eq!(first[..HEADER_WORDS], [1, 576, 0, 0, 256, 0, 0, 0]);
     assert!(
         first[HEADER_WORDS..].iter().any(|&w| w != 0),
         "the first frame wrote no resume records"
@@ -1143,9 +1145,12 @@ fn glass_state_clear_covers_only_the_header() {
     frame(&mut renderer, &scene, true);
     let second = glass_state_words(&renderer);
     assert_eq!(second.len(), first.len(), "the pooled buffer changed");
-    assert_eq!(second[..HEADER_WORDS], [1, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(second[..HEADER_WORDS], [1, 576, 0, 0, 0, 0, 0, 0]);
+    // List 0 is rewritten each frame, in whatever order the tiles ran; the phase lists and
+    // resume records after it are written only by stops.
+    let records = HEADER_WORDS + 576;
     assert!(
-        second[HEADER_WORDS..] == first[HEADER_WORDS..],
+        second[records..] == first[records..],
         "the clear reached past the header"
     );
 }
@@ -1166,7 +1171,7 @@ fn forced_glass_permutation_without_markers_is_identical() {
         );
         assert!(capture.frame.is_empty() && capture.frame_phases == 0);
         assert!(capture.phases.is_empty(), "{aa:?}: a phase was recorded");
-        // No setup dispatch ran, so the header stays as cleared.
+        // No tile has glass commands and no phase ran, so the header stays as cleared.
         assert_eq!(glass_state_words(&renderer)[..8], [0; 8]);
         let delta = max_delta(&stock, &forced);
         // The glass permutation may round differently under fast math, by at most one level.
@@ -1178,5 +1183,84 @@ fn forced_glass_permutation_without_markers_is_identical() {
             delta <= 1,
             "{aa:?}: forcing changed the output by {delta} levels"
         );
+    }
+}
+
+/// Returns the indices of the 16 px tiles of `rects`, snapped outward and clipped to a
+/// `width`×`height` target, in order and without repeats.
+fn tiles_of(rects: &[IRect], width: u32, height: u32) -> Vec<u32> {
+    let (columns, rows) = (width.div_ceil(16), height.div_ceil(16));
+    let mut tiles: Vec<u32> = rects
+        .iter()
+        .flat_map(|r| {
+            let r = r.snap_out(16);
+            let [x0, y0] = [r.x0, r.y0].map(|v| (v.max(0) / 16) as u32);
+            let x1 = ((r.x1.max(0) / 16) as u32).min(columns);
+            let y1 = ((r.y1.max(0) / 16) as u32).min(rows);
+            (y0..y1).flat_map(move |y| (x0..x1).map(move |x| y * columns + x))
+        })
+        .collect();
+    tiles.sort_unstable();
+    tiles.dedup();
+    tiles
+}
+
+#[test]
+#[cfg_attr(skip_gpu_tests, ignore)]
+fn lite_fine_leaves_glass_tiles_unwritten() {
+    let glass_tiles = tiles_of(&[REGION], 512, 512);
+    for aa in [AaConfig::Area, AaConfig::Msaa8, AaConfig::Msaa16] {
+        let mut renderer = gpu_renderer(AaSupport::all());
+        let mut stock_scene = Scene::new();
+        plain(&mut stock_scene, Part::Unmarked);
+        let stock = render_frame(&mut renderer, 512, 512, aa, &stock_scene, None);
+        let mut scene = Scene::new();
+        plain(&mut scene, Part::Marked);
+        renderer.set_glass_start_pass_disabled(true);
+        let lite = render_frame(&mut renderer, 512, 512, aa, &scene, Some(&mut NoGlass));
+        let pixels = (0..512_u32).flat_map(|y| (0..512_u32).map(move |x| (x, y)));
+        for ((x, y), (stock_px, lite_px)) in pixels.zip(stock.chunks(4).zip(lite.chunks(4))) {
+            let tile = (y / 16) * 32 + x / 16;
+            if glass_tiles.binary_search(&tile).is_ok() {
+                // The target starts zeroed, and no pass wrote it.
+                assert_eq!(
+                    lite_px, [0; 4],
+                    "{aa:?}: glass pixel ({x}, {y}) was written"
+                );
+            } else {
+                assert_eq!(
+                    lite_px, stock_px,
+                    "{aa:?}: pixel ({x}, {y}) differs from stock"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[cfg_attr(skip_gpu_tests, ignore)]
+fn glass_tile_list_holds_exactly_the_tiles_with_glass_commands() {
+    // The list of tiles with glass commands, after the 8-word header; its count is word 1.
+    const HEADER_WORDS: usize = 8;
+    let mut scene = sixteen_markers();
+    // A seventeenth marker that reaches past the target's corner.
+    let corner = (rect(500, 500, 600, 600), rect(510, 510, 590, 590));
+    marker_with_id(&mut scene, 16, corner.0, corner.1);
+    let mut regions: Vec<IRect> = (0..16)
+        .map(|id| {
+            let (x, y) = (128 * (id % 4), 128 * (id / 4));
+            rect(x + 16, y + 16, x + 112, y + 112)
+        })
+        .collect();
+    regions.push(corner.0);
+    let expected = tiles_of(&regions, 512, 512);
+    for aa in [AaConfig::Area, AaConfig::Msaa16] {
+        let mut renderer = gpu_renderer(AaSupport::all());
+        render_frame(&mut renderer, 512, 512, aa, &scene, Some(&mut NoGlass));
+        let words = glass_state_words(&renderer);
+        let count = words[1] as usize;
+        let mut list = words[HEADER_WORDS..HEADER_WORDS + count].to_vec();
+        list.sort_unstable();
+        assert_eq!(list, expected, "{aa:?}: the glass tile list differs");
     }
 }

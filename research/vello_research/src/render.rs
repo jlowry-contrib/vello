@@ -92,8 +92,8 @@ pub(crate) fn render_full(
     render_encoding_full(scene.encoding(), resolver, shaders, image_atlas, params)
 }
 
-/// Size of `glass_state`'s header, which is zeroed each frame: the running phase, three
-/// padding words and the stop count of each of the four phases, as `u32`s.
+/// Size of `glass_state`'s header, which is zeroed each frame: the running phase, list 0's
+/// length, two free words and the stop count of each of the four phases, as `u32`s.
 const GLASS_STATE_HEADER_SIZE: u64 = 32;
 
 /// Words in a resume record's header: command index, clip depth, tile index and marker.
@@ -105,18 +105,23 @@ const GLASS_COLOR_WORDS: [u64; 2] = [1024, 512];
 /// Words of a stopped tile's register blend stack: `BLEND_STACK_SPLIT` (4) levels of 256 pixels.
 const GLASS_STACK_WORDS: u64 = 1024;
 
+/// Resources the start and resume permutations bind after stock fine's: the marker table,
+/// the glass state, the backdrop atlas and the glass atlas.
+const GLASS_FINE_RESOURCES: usize = 4;
+
 /// Bytes of one phase's indirect dispatch arguments: `(count_x, 1, 1, pad)`.
 const GLASS_ARGS_SIZE: u64 = 16;
 
-/// Returns the size in bytes of `glass_state` for the given phase capacities.
+/// Returns the size in bytes of `glass_state` for list 0's and the phases' capacities.
 ///
-/// The layout, in `u32` words, mirrors `fine.wgsl`: the 8-word header, then each phase's
-/// tile list (`capacity` words), then each phase's resume records (`capacity` records).
-fn glass_state_size(capacities: [u32; 4], resume_color: u32) -> u64 {
+/// The layout, in `u32` words, mirrors `fine.wgsl`: the 8-word header, then list 0
+/// (`list_capacity` words), then each phase's tile list (`capacity` words), then each
+/// phase's resume records (`capacity` records).
+fn glass_state_size(list_capacity: u32, capacities: [u32; 4], resume_color: u32) -> u64 {
     let tiles: u64 = capacities.iter().map(|&c| u64::from(c)).sum();
     let record =
         GLASS_RECORD_HEADER_WORDS + GLASS_COLOR_WORDS[resume_color as usize] + GLASS_STACK_WORDS;
-    GLASS_STATE_HEADER_SIZE + 4 * tiles * (1 + record)
+    GLASS_STATE_HEADER_SIZE + 4 * u64::from(list_capacity) + 4 * tiles * (1 + record)
 }
 
 /// One frame's glass settings and resources.
@@ -126,7 +131,11 @@ pub(crate) struct GlassRender<'a> {
     pub(crate) phases: u32,
     pub(crate) resume_color: u32,
     pub(crate) flags: u32,
+    /// Most tiles with glass commands, the capacity of list 0.
+    pub(crate) list_capacity: u32,
     pub(crate) capacities: [u32; 4],
+    /// Whether phase 0 runs the start pass and the later phases run; off only in tests.
+    pub(crate) start_pass: bool,
     pub(crate) backdrop_atlas: ImageProxy,
     pub(crate) glass_atlas: ImageProxy,
 }
@@ -295,6 +304,7 @@ impl Render {
             gpu.glass_phases = glass.phases;
             gpu.glass_resume_color = glass.resume_color;
             gpu.glass_flags = glass.flags;
+            gpu.glass_capacity_0 = glass.list_capacity;
             [
                 gpu.glass_capacity_1,
                 gpu.glass_capacity_2,
@@ -662,6 +672,8 @@ impl Render {
 
     /// Run fine rasterization, as glass phase 0 followed by the external phases if `glass` is set.
     ///
+    /// Glass phase 0 runs the lite permutation over every tile, which lists the tiles with
+    /// glass commands and leaves them unwritten, then the start permutation over that list.
     /// Each external phase is followed by a dispatch that resumes the tiles stopped for it.
     fn record_fine_inner(
         &mut self,
@@ -674,7 +686,7 @@ impl Render {
         let glass_bufs = glass.map(|glass| {
             let markers = recording.upload("vello.glass_markers", bytemuck::cast_slice(glass.rows));
             let state = BufferProxy::new(
-                glass_state_size(glass.capacities, glass.resume_color),
+                glass_state_size(glass.list_capacity, glass.capacities, glass.resume_color),
                 "vello.glass_state",
             );
             recording.push(Command::Clear(state, 0, Some(GLASS_STATE_HEADER_SIZE)));
@@ -689,14 +701,12 @@ impl Render {
             ]
         });
         let glass_resources = glass_resources.iter().flatten().copied();
-        // The shader for phase 0 and, with glass, the shader that resumes stopped tiles.
-        let (fine_shader, resume_shader, resources) = match fine.aa_config {
+        // The shader for every tile and, with glass, the start and resume shaders.
+        let (fine_shader, glass_fine, resources) = match fine.aa_config {
             AaConfig::Area => {
-                let (shader, resume) = if let Some(glass) = glass {
-                    (
-                        glass.shaders.fine_area_glass,
-                        glass.shaders.fine_area_resume,
-                    )
+                let (shader, glass_fine) = if let Some(glass) = glass {
+                    let s = glass.shaders;
+                    (s.fine_area_lite, s.fine_area_start.zip(s.fine_area_resume))
                 } else {
                     (shaders.fine_area, None)
                 };
@@ -712,7 +722,7 @@ impl Render {
                 ];
                 (
                     shader.expect("shaders not configured to support AA mode: area"),
-                    resume,
+                    glass_fine,
                     resources
                         .into_iter()
                         .chain(glass_resources)
@@ -729,19 +739,25 @@ impl Render {
                     let buf = recording.upload("vello.mask_lut", mask_lut);
                     self.mask_buf = Some(buf.into());
                 }
-                let (fine_shader, resume, mode) = match (fine.aa_config, glass) {
+                let (fine_shader, glass_fine, mode) = match (fine.aa_config, glass) {
                     (AaConfig::Msaa16, None) => (shaders.fine_msaa16, None, "msaa16"),
                     (AaConfig::Msaa8, None) => (shaders.fine_msaa8, None, "msaa8"),
-                    (AaConfig::Msaa16, Some(glass)) => (
-                        glass.shaders.fine_msaa16_glass,
-                        glass.shaders.fine_msaa16_resume,
-                        "msaa16",
-                    ),
-                    (AaConfig::Msaa8, Some(glass)) => (
-                        glass.shaders.fine_msaa8_glass,
-                        glass.shaders.fine_msaa8_resume,
-                        "msaa8",
-                    ),
+                    (AaConfig::Msaa16, Some(glass)) => {
+                        let s = glass.shaders;
+                        (
+                            s.fine_msaa16_lite,
+                            s.fine_msaa16_start.zip(s.fine_msaa16_resume),
+                            "msaa16",
+                        )
+                    }
+                    (AaConfig::Msaa8, Some(glass)) => {
+                        let s = glass.shaders;
+                        (
+                            s.fine_msaa8_lite,
+                            s.fine_msaa8_start.zip(s.fine_msaa8_resume),
+                            "msaa8",
+                        )
+                    }
                     _ => unreachable!(),
                 };
                 let fine_shader = fine_shader
@@ -759,7 +775,7 @@ impl Render {
                 ];
                 (
                     fine_shader,
-                    resume,
+                    glass_fine,
                     resources
                         .into_iter()
                         .chain(glass_resources)
@@ -767,13 +783,37 @@ impl Render {
                 )
             }
         };
-        recording.dispatch(fine_shader, fine_wg_count, resources.iter().copied());
-        if let Some((glass, (markers, state))) = glass.zip(glass_bufs) {
-            let resume_shader = resume_shader.expect("glass permutations come with resume ones");
-            // `(count_x, 1, 1, pad)` per phase, written by `glass_resume_setup`.
+        let Some((glass, (markers, state))) = glass.zip(glass_bufs) else {
+            recording.dispatch(fine_shader, fine_wg_count, resources.iter().copied());
+            self.free_fine(recording, fine);
+            return;
+        };
+        // The lite pass binds stock fine's resources, then the glass state.
+        let stock_count = resources.len() - GLASS_FINE_RESOURCES;
+        let lite_resources = resources[..stock_count]
+            .iter()
+            .copied()
+            .chain([ResourceProxy::Buffer(state)]);
+        recording.dispatch(fine_shader, fine_wg_count, lite_resources);
+        let (start_shader, resume_shader) =
+            glass_fine.expect("lite permutations come with start and resume ones");
+        if glass.start_pass {
+            // `(count_x, 1, 1, pad)` per phase, written by `glass_resume_setup`, then list
+            // 0's, written by `glass_start_setup`.
             let args = BufferProxy::new(
-                u64::from(MAX_GLASS_PHASES) * GLASS_ARGS_SIZE,
+                u64::from(MAX_GLASS_PHASES + 1) * GLASS_ARGS_SIZE,
                 "vello.glass_args",
+            );
+            recording.dispatch(
+                glass.shaders.glass_start_setup,
+                (1, 1, 1),
+                [ResourceProxy::Buffer(state), ResourceProxy::Buffer(args)],
+            );
+            recording.dispatch_indirect(
+                start_shader,
+                args,
+                u64::from(MAX_GLASS_PHASES) * GLASS_ARGS_SIZE,
+                resources.iter().copied(),
             );
             for phase in 1..=glass.phases {
                 recording.push(Command::External(phase));
@@ -790,9 +830,14 @@ impl Render {
                 );
             }
             recording.free_buffer(args);
-            recording.free_buffer(markers);
-            recording.free_buffer(state);
         }
+        recording.free_buffer(markers);
+        recording.free_buffer(state);
+        self.free_fine(recording, fine);
+    }
+
+    /// Frees fine's resources after its dispatches.
+    fn free_fine(&mut self, recording: &mut Recording, fine: FineResources) {
         recording.free_resource(fine.config_buf);
         recording.free_resource(fine.tile_buf);
         recording.free_resource(fine.segments_buf);

@@ -159,6 +159,8 @@ pub struct ConfigUniform {
     pub glass_resume_color: u32,
     /// Glass control flags; bit 0 skips every stop (a test control).
     pub glass_flags: u32,
+    /// Capacity of glass tile list 0, the tiles with glass commands, in tiles.
+    pub glass_capacity_0: u32,
     /// Capacity of the phase 1 resume buffer, in stops.
     pub glass_capacity_1: u32,
     /// Capacity of the phase 2 resume buffer, in stops.

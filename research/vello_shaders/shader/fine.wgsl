@@ -75,6 +75,29 @@ var<storage> mask_lut: array<u32, 2048u>;
 
 #endif
 
+// `glass_state` header, in words; mirrors `GLASS_STATE_HEADER_SIZE` in `vello`'s `render.rs`.
+// [0] the running phase, which `glass_resume_setup` increments before each resume dispatch.
+const GLASS_STATE_PHASE = 0u;
+// [1] the length of list 0, the tiles in which the lite pass met a glass command.
+const GLASS_STATE_TILES0 = 1u;
+// [2..4) free.
+// [4 + j - 1] the stop count of phase j.
+const GLASS_STATE_STOPS = 4u;
+// [8..) list 0, then the tile lists of phases 1..4, then their resume records.
+const GLASS_STATE_TILES = 8u;
+
+// The lite permutations bind only `glass_state`, after the MSAA mask LUT when there is one.
+#ifdef lite
+#ifdef msaa
+const GLASS_STATE_INDEX: u32 = 9;
+#else
+const GLASS_STATE_INDEX: u32 = 8;
+#endif
+
+@group(0) @binding(GLASS_STATE_INDEX)
+var<storage, read_write> glass_state: array<atomic<u32>>;
+#endif
+
 // Glass bindings, after the MSAA mask LUT when there is one.
 #ifdef glass
 #ifdef msaa
@@ -107,13 +130,7 @@ struct GlassMarker {
 const GLASS_RUNNING_PHASE = 0u;
 #endif
 
-// `glass_state` layout, in words; mirrors `glass_state_size` in `vello`'s `render.rs`.
-// [0] the running phase, which `glass_resume_setup` increments before each resume dispatch.
-const GLASS_STATE_PHASE = 0u;
-// [4 + j - 1] the stop count of phase j; [1..4) is padding.
-const GLASS_STATE_STOPS = 4u;
-// [8..) the tile lists of phases 1..4, then their resume records.
-const GLASS_STATE_TILES = 8u;
+// The rest of `glass_state` mirrors `glass_state_size` in `vello`'s `render.rs`.
 // Resume record header: COMPOSITE command index, clip depth, tile index, marker.
 const GLASS_RECORD_HEADER = 4u;
 // Colour words per stopped tile: four `f32` or two packed `unorm16` pairs per pixel.
@@ -141,6 +158,10 @@ var<workgroup> glass_slot: u32;
 #ifdef resume
 // Thread 0's reads for a resumed tile: phase, command index, clip depth and tile index.
 var<workgroup> glass_resume: vec4<u32>;
+#endif
+#ifdef start
+// Thread 0's read of the tile this workgroup takes from list 0.
+var<workgroup> glass_start_tile: u32;
 #endif
 
 // Returns the most tiles that can stop for phase `j`, from 1.
@@ -171,14 +192,14 @@ fn glass_record_words() -> u32 {
     return GLASS_RECORD_HEADER + glass_color_words() + GLASS_STACK_WORDS;
 }
 
-// Returns the first word of phase `j`'s tile list.
+// Returns the first word of phase `j`'s tile list, after list 0.
 fn glass_tiles_base(j: u32) -> u32 {
-    return GLASS_STATE_TILES + glass_capacity_before(j);
+    return GLASS_STATE_TILES + config.glass_capacity_0 + glass_capacity_before(j);
 }
 
 // Returns the first word of resume record `slot` of phase `j`.
 fn glass_record_base(j: u32, slot: u32) -> u32 {
-    let records = GLASS_STATE_TILES + glass_capacity_before(5u);
+    let records = glass_tiles_base(5u);
     return records + (glass_capacity_before(j) + slot) * glass_record_words();
 }
 
@@ -1274,8 +1295,23 @@ fn main(
 #ifdef glass
     let running_phase = GLASS_RUNNING_PHASE;
 #endif
+#ifdef start
+    // One workgroup per tile of list 0, run from command 0.
+    if wg_id.x >= config.glass_capacity_0 {
+        // Only a planning bug overfills list 0; the lite pass listed no tile past it.
+        return;
+    }
+    if local_id.x == 0u && local_id.y == 0u {
+        glass_start_tile = atomicLoad(&glass_state[GLASS_STATE_TILES + wg_id.x]);
+    }
+    let tile_ix = workgroupUniformLoad(&glass_start_tile);
+    let tile_xy = vec2(tile_ix % config.width_in_tiles, tile_ix / config.width_in_tiles);
+    let pixel_xy = tile_xy * vec2(TILE_WIDTH, TILE_HEIGHT) + vec2(local_id.x * PIXELS_PER_THREAD, local_id.y);
+    let xy = vec2<f32>(pixel_xy);
+#else
     let tile_ix = wg_id.y * config.width_in_tiles + wg_id.x;
     let xy = vec2(f32(global_id.x * PIXELS_PER_THREAD), f32(global_id.y));
+#endif
 #endif
     let local_xy = vec2(f32(local_id.x * PIXELS_PER_THREAD), f32(local_id.y));
     var rgba: array<vec4<f32>, PIXELS_PER_THREAD>;
@@ -1383,6 +1419,19 @@ fn main(
                 }
                 cmd_ix += 3u;
             }
+#ifdef lite
+            case CMD_GLASS_FLATTEN, CMD_GLASS_SNAPSHOT, CMD_GLASS_STOP, CMD_GLASS_COMPOSITE: {
+                // Leaves the tile to the start pass: lists it and returns without output. Every
+                // thread reads the same tag, so the whole workgroup returns here.
+                if local_id.x == 0u && local_id.y == 0u {
+                    let slot = atomicAdd(&glass_state[GLASS_STATE_TILES0], 1u);
+                    if slot < config.glass_capacity_0 {
+                        atomicStore(&glass_state[GLASS_STATE_TILES + slot], tile_ix);
+                    }
+                }
+                return;
+            }
+#endif
 #ifdef glass
             case CMD_GLASS_FLATTEN: {
                 // Closes open level `level` into `flat`, leaving `rgba` and the blend stack as they are.

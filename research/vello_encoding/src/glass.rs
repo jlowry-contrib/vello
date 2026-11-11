@@ -285,17 +285,57 @@ pub fn assign_phases_fitting(
 
 /// Packs `(width, height)` slots onto shelves, returning their origins and the atlas size.
 ///
-/// Slots go on shelves tallest first, left to right, in an atlas as wide as the larger of
-/// `min_width` and the widest slot rounded up to a power of two. The height is rounded up
-/// to a power of two.
-pub fn pack_shelves(sizes: &[(u32, u32)], min_width: u32) -> (Vec<(u32, u32)>, (u32, u32)) {
+/// Slots go on shelves tallest first, left to right. The atlas width is a power of two from
+/// the larger of `min_width` and the widest slot rounded up, widened while that saves area
+/// and stays within `max_side`; the height is rounded up to a power of two. Among the
+/// widths whose atlas fits in `max_side`, the smallest area wins, then the smaller longer
+/// side, then the narrower. When no width fits, the tried atlas with the shortest longer side
+/// is returned, so the caller can see it passes `max_side`.
+pub fn pack_shelves(
+    sizes: &[(u32, u32)],
+    min_width: u32,
+    max_side: u32,
+) -> (Vec<(u32, u32)>, (u32, u32)) {
     let widest = sizes.iter().map(|&(w, _)| w).max().unwrap_or(0);
-    let width = min_width.max(widest.next_power_of_two());
     let mut order: Vec<usize> = (0..sizes.len()).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(sizes[i].1));
+    let start = min_width.max(widest.next_power_of_two());
+    let (mut best_key, mut best) = (None, (Vec::new(), (0, 0)));
+    let mut width = start;
+    loop {
+        let (origins, size) = pack_shelves_at(sizes, &order, width);
+        let long = size.0.max(size.1);
+        let fits = long <= max_side;
+        let area = u64::from(size.0) * u64::from(size.1);
+        // Fitting atlases sort first, by area; others by their longer side.
+        let key = if fits {
+            (false, area, long, width)
+        } else {
+            (true, u64::from(long), long, width)
+        };
+        if best_key.is_none_or(|best_key| key < best_key) {
+            (best_key, best) = (Some(key), (origins, size));
+        }
+        // A wider atlas can't fit past `max_side`, nor get shorter once one shelf holds every
+        // slot.
+        let one_shelf = sizes.iter().map(|&(w, _)| u64::from(w)).sum::<u64>() <= u64::from(width);
+        match width.checked_mul(2) {
+            Some(wider) if width < max_side && !one_shelf => width = wider,
+            _ => break,
+        }
+    }
+    best
+}
+
+/// Packs slots in `order` onto shelves of `width`, as [`pack_shelves`] does for one width.
+fn pack_shelves_at(
+    sizes: &[(u32, u32)],
+    order: &[usize],
+    width: u32,
+) -> (Vec<(u32, u32)>, (u32, u32)) {
     let mut origins = vec![(0, 0); sizes.len()];
     let (mut x, mut y, mut shelf) = (0, 0, 0);
-    for i in order {
+    for &i in order {
         let (w, h) = sizes[i];
         if x + w > width {
             y += shelf;
@@ -637,7 +677,7 @@ mod tests {
     #[test]
     fn shelves_pack_without_overlap_into_power_of_two_sizes() {
         let sizes = [(320, 128), (64, 64), (512, 32)];
-        let (origins, size) = pack_shelves(&sizes, 512);
+        let (origins, size) = pack_shelves(&sizes, 512, 8192);
         assert_eq!(size, (512, 256));
         let rects: Vec<_> = origins
             .iter()
@@ -654,8 +694,31 @@ mod tests {
     }
 
     #[test]
+    fn shelves_widen_before_they_grow_tall() {
+        // Twenty 416 px slots, one per shelf at 512 px, would stack to 8320 px and round up to
+        // 16384; wider shelves fit them in an 8192 px limit.
+        let sizes = [(416, 416); 20];
+        let (origins, size) = pack_shelves(&sizes, 512, 8192);
+        assert_eq!(size, (2048, 4096));
+        assert!(
+            origins
+                .iter()
+                .all(|&(x, y)| x + 416 <= 2048 && y + 416 <= 4096)
+        );
+        // About 256 px slots, which stacked to 8192 px, now take a quarter of that height.
+        let (_, size) = pack_shelves(&[(272, 272); 20], 512, 8192);
+        assert_eq!(size, (1024, 2048));
+    }
+
+    #[test]
+    fn shelves_report_the_shortest_atlas_when_none_fits() {
+        let (_, size) = pack_shelves(&[(416, 416); 20], 512, 1024);
+        assert_eq!(size, (1024, 8192));
+    }
+
+    #[test]
     fn shelves_widen_to_the_widest_slot() {
-        let (_, size) = pack_shelves(&[(700, 10)], 512);
+        let (_, size) = pack_shelves(&[(700, 10)], 512, 8192);
         assert_eq!(size, (1024, 16));
     }
 }

@@ -1554,15 +1554,17 @@ fn state_limit_leaves_markers_out_and_logs_on_change() {
         let ids: Vec<_> = capture.frame.iter().map(|p| p.id).collect();
         assert_eq!(ids, (0..15).collect::<Vec<_>>());
     }
+    // The texture limit follows, and depends on the adapter.
     let message = format!(
-        "glass.state.full left_out=1 over_size=1 limit={limit} over_dispatch=0 workgroups=65535"
+        "glass.state.full left_out=1 over_size=1 limit={limit} over_dispatch=0 workgroups=65535 \
+         over_atlas=0 texture_side="
     );
     let count = logs
         .0
         .lock()
         .unwrap()
         .iter()
-        .filter(|m| **m == message)
+        .filter(|m| m.starts_with(&message))
         .count();
     assert_eq!(
         count, 1,

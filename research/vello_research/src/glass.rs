@@ -36,12 +36,16 @@ pub struct MarkerPlacement {
 }
 
 /// Why a frame leaves out a marker that has pixels on the target.
+///
+/// Only the renderer's logs report it (`glass.phase.capped`, `glass.state.full`).
+#[cfg(feature = "wgpu")]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum GlassLeftOut {
+pub(crate) enum GlassLeftOut {
     /// The marker would need a phase past [`MAX_GLASS_PHASES`].
     PhaseCap,
-    /// The marker's tiles don't fit: its resume records would take the glass state past the
-    /// device's storage binding limit, or a list past the device's dispatch limit.
+    /// The marker doesn't fit the device: its resume records would take the glass state past
+    /// the storage binding limit, a list past the dispatch limit, or an atlas past the
+    /// texture size limit.
     StateFull,
 }
 
@@ -144,8 +148,11 @@ pub(crate) struct GlassPlan {
     pub(crate) record_words: [u32; MAX_GLASS_PHASES as usize],
     /// State-full markers whose records would pass the size limit.
     pub(crate) over_size: usize,
-    /// State-full markers whose tiles would pass the dispatch limit; a marker can pass both.
+    /// State-full markers whose tiles would pass the dispatch limit; a marker can pass more
+    /// than one limit.
     pub(crate) over_dispatch: usize,
+    /// State-full markers whose slots would take an atlas past the texture size limit.
+    pub(crate) over_atlas: usize,
     /// Why the frame leaves out each encoded marker, if it does and the marker has pixels on
     /// the target under at most [`MAX_GLASS_LAYERS`] open layers.
     pub(crate) left_out: Vec<Option<GlassLeftOut>>,
@@ -175,6 +182,9 @@ pub(crate) struct GlassLimits {
     pub(crate) workgroups: u32,
     /// Resume colour format, 0 for `F32` and 1 for `Unorm16`.
     pub(crate) resume_color: u32,
+    /// Longest side of an atlas texture, in pixels. Neither atlas format adds a limit of its
+    /// own to the device's `max_texture_dimension_2d`.
+    pub(crate) texture_side: u32,
 }
 
 /// Returns the placements of phase `index`, given placements ordered by phase.
@@ -214,8 +224,9 @@ const MIN_ATLAS_WIDTH: u32 = 512;
 /// Lays out a frame's glass for a `width`×`height` target within `limits`.
 ///
 /// Markers under more than [`MAX_GLASS_LAYERS`] open layers, with no pixels on the
-/// target, past the phase cap or past the glass state's limits are left out: their rows
-/// have phase 0 and they get no placement. Markers are kept in paint order while they fit;
+/// target, past the phase cap, past the glass state's limits or whose slots would take an
+/// atlas past the texture size limit are left out: their rows have phase 0 and they get no
+/// placement. Both atlas sizes the plan returns fit in `limits.texture_side`. Markers are kept in paint order while they fit;
 /// one that doesn't is left out and later ones are still tried.
 #[cfg(feature = "wgpu")]
 pub(crate) fn plan(
@@ -266,7 +277,13 @@ pub(crate) fn plan(
     let mut depths = [0; MAX_GLASS_PHASES as usize];
     // Whether the state's limits rejected each included marker.
     let mut state_full = vec![false; clamped.len()];
-    let (mut over_size, mut over_dispatch) = (0, 0);
+    let (mut over_size, mut over_dispatch, mut over_atlas) = (0, 0, 0);
+    // Slot sizes of the markers kept so far, in paint order, as the final packing sees them.
+    let (mut backdrop_sizes, mut glass_sizes) = (Vec::new(), Vec::new());
+    let fits_atlas = |sizes: &[(u32, u32)]| {
+        let (_, (w, h)) = pack_shelves(sizes, MIN_ATLAS_WIDTH, limits.texture_side);
+        w <= limits.texture_side && h <= limits.texture_side
+    };
     let (phases, capped) = assign_phases_fitting(&clamped, |j, phase| {
         let p = phase as usize - 1;
         let regions = region_tiles + u64::from(tile_count(clamped[j].region));
@@ -276,17 +293,24 @@ pub(crate) fn plan(
         let mut deepest = depths;
         deepest[p] = deepest[p].max(markers.depths[included[j]]);
         let words = deepest.map(|d| glass_record_words(limits.resume_color, d));
-        let size = pooled_size(glass_state_size(list, caps, words));
-        let fits_size = size <= limits.state_size;
+        let state_size = pooled_size(glass_state_size(list, caps, words));
+        let fits_size = state_size <= limits.state_size;
         let fits_dispatch = list <= limits.workgroups && caps[p] <= limits.workgroups;
-        if fits_size && fits_dispatch {
+        backdrop_sizes.push(size(clamped[j].region));
+        glass_sizes.push(size(clamped[j].composite));
+        let fits_atlases = fits_atlas(&backdrop_sizes) && fits_atlas(&glass_sizes);
+        let fits = fits_size && fits_dispatch && fits_atlases;
+        if fits {
             (region_tiles, list_capacity, capacities, depths) = (regions, list, caps, deepest);
         } else {
+            backdrop_sizes.pop();
+            glass_sizes.pop();
             state_full[j] = true;
             over_size += usize::from(!fits_size);
             over_dispatch += usize::from(!fits_dispatch);
+            over_atlas += usize::from(!fits_atlases);
         }
-        fits_size && fits_dispatch
+        fits
     });
     if capped > 0 {
         log::warn!("glass.phase.capped markers={capped} max={MAX_GLASS_PHASES}");
@@ -308,10 +332,10 @@ pub(crate) fn plan(
         .filter(|&(_, phase)| phase != 0)
         .map(|((i, marker), phase)| (i, marker, phase))
         .collect();
-    let backdrop_sizes: Vec<_> = kept.iter().map(|&(_, m, _)| size(m.region)).collect();
-    let glass_sizes: Vec<_> = kept.iter().map(|&(_, m, _)| size(m.composite)).collect();
-    let (backdrop_origins, backdrop_size) = pack_shelves(&backdrop_sizes, MIN_ATLAS_WIDTH);
-    let (glass_origins, glass_size) = pack_shelves(&glass_sizes, MIN_ATLAS_WIDTH);
+    let (backdrop_origins, backdrop_size) =
+        pack_shelves(&backdrop_sizes, MIN_ATLAS_WIDTH, limits.texture_side);
+    let (glass_origins, glass_size) =
+        pack_shelves(&glass_sizes, MIN_ATLAS_WIDTH, limits.texture_side);
     let pack = |(x, y): (u32, u32)| x | y << 16;
     let mut rows = vec![GlassMarkerRow::default(); markers.len()];
     let mut placements = Vec::with_capacity(kept.len());
@@ -351,6 +375,7 @@ pub(crate) fn plan(
         record_words: depths.map(|d| glass_record_words(limits.resume_color, d)),
         over_size,
         over_dispatch,
+        over_atlas,
         left_out,
         left_out_offsets,
     }
@@ -432,6 +457,7 @@ mod tests {
         state_size: 128 << 20,
         workgroups: 65535,
         resume_color: 0,
+        texture_side: 8192,
     };
 
     fn plan(markers: &GlassMarkers, width: u32, height: u32) -> GlassPlan {
@@ -542,7 +568,10 @@ mod tests {
             assert_eq!(plan.rows[i].phase, 0, "marker {i}");
         }
         assert_eq!(plan.state_full(), 7);
-        assert_eq!((plan.over_size, plan.over_dispatch), (7, 0));
+        assert_eq!(
+            (plan.over_size, plan.over_dispatch, plan.over_atlas),
+            (7, 0, 0)
+        );
         assert_eq!(plan.capacities, [254, 0, 0, 0]);
         assert_eq!(plan.list_capacity, 254);
         assert_eq!(state_size(&plan), 32 + 254 * 4120);
@@ -565,8 +594,43 @@ mod tests {
         let kept: Vec<_> = plan.placements.iter().map(|p| p.id).collect();
         assert_eq!(kept, [0, 2]);
         assert_eq!(plan.left_out[1], Some(GlassLeftOut::StateFull));
-        assert_eq!((plan.over_size, plan.over_dispatch), (0, 1));
+        assert_eq!(
+            (plan.over_size, plan.over_dispatch, plan.over_atlas),
+            (0, 1, 0)
+        );
         assert_eq!(plan.list_capacity, 17);
+    }
+
+    #[test]
+    fn markers_past_the_atlas_limit_are_left_out() {
+        // Under a 1024 px texture limit, an atlas holds sixteen 256 px slots on four shelves.
+        // After twelve of them, a 512 px marker would need a 512 px shelf of its own plus
+        // three more, so it's left out, and the next four 256 px markers still fit.
+        let mut list: Vec<_> = (0..17)
+            .map(|i| {
+                let r = r(256 * i, 0, 256 * (i + 1), 256);
+                (i as u32, r, r, 0)
+            })
+            .collect();
+        list.insert(12, (99, r(0, 512, 512, 1024), r(0, 512, 512, 1024), 0));
+        let limits = GlassLimits {
+            texture_side: 1024,
+            ..LIMITS
+        };
+        let plan = super::plan(&markers(&list), 4352, 1024, limits);
+        let kept: Vec<_> = plan.placements.iter().map(|p| p.id).collect();
+        assert_eq!(kept, (0..16).collect::<Vec<_>>());
+        for i in [12, 17] {
+            assert_eq!(plan.left_out[i], Some(GlassLeftOut::StateFull), "{i}");
+            assert_eq!(plan.rows[i].phase, 0, "{i}");
+        }
+        assert_eq!(
+            (plan.over_size, plan.over_dispatch, plan.over_atlas),
+            (0, 0, 2)
+        );
+        assert_eq!(plan.backdrop_size, (1024, 1024));
+        assert_eq!(plan.glass_size, (1024, 1024));
+        assert_eq!(plan.left_out_offsets, [36, 51]);
     }
 
     #[test]

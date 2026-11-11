@@ -466,6 +466,10 @@ fn fit_glass_atlas(
         *sizer = glass::AtlasSizer::default();
     }
     let max = device.limits().max_texture_dimension_2d;
+    debug_assert!(
+        size.0 <= max && size.1 <= max,
+        "glass plan sized an atlas of {size:?} past the {max} px texture limit"
+    );
     let (width, height) = sizer
         .fit(size, max)
         .map_err(|(width, height)| Error::GlassAtlasTooLarge(width, height, max))?;
@@ -628,8 +632,9 @@ impl Renderer {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::GlassAtlasTooLarge`] if an atlas would exceed the device's texture
-    /// limit, and the errors of `render_to_texture`.
+    /// Returns the errors of `render_to_texture`. Markers whose atlas slots would pass the
+    /// device's texture limit are left out, so [`Error::GlassAtlasTooLarge`] is only a
+    /// backstop.
     pub fn render_to_texture_with_glass(
         &mut self,
         device: &Device,
@@ -653,20 +658,27 @@ impl Renderer {
                 GlassResumeFormat::F32 => 0,
                 GlassResumeFormat::Unorm16 => 1,
             },
+            texture_side: device_limits.max_texture_dimension_2d,
         };
         let mut plan = glass::plan(markers, params.width, params.height, limits);
         let state_full = plan.state_full();
         if state_full != self.glass_state_full {
             self.glass_state_full = state_full;
             let (over_size, over_dispatch) = (plan.over_size, plan.over_dispatch);
+            let over_atlas = plan.over_atlas;
             let (limit, workgroups) = (limits.state_size, limits.workgroups);
+            let texture_side = limits.texture_side;
             if state_full > 0 {
                 log::warn!(
                     "glass.state.full left_out={state_full} over_size={over_size} \
-                     limit={limit} over_dispatch={over_dispatch} workgroups={workgroups}"
+                     limit={limit} over_dispatch={over_dispatch} workgroups={workgroups} \
+                     over_atlas={over_atlas} texture_side={texture_side}"
                 );
             } else {
-                log::info!("glass.state.full left_out=0 limit={limit} workgroups={workgroups}");
+                log::info!(
+                    "glass.state.full left_out=0 limit={limit} workgroups={workgroups} \
+                     texture_side={texture_side}"
+                );
             }
         }
         if let (Some(list), _) = self.glass_capacity_for_tests {

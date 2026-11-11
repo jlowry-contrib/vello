@@ -127,6 +127,19 @@ pub(crate) fn phase_placements(placements: &[MarkerPlacement], index: u32) -> &[
     &placements[start..end]
 }
 
+/// Lays out a frame that runs the glass permutation with no glass: a zeroed marker table
+/// with a row per encoded marker (at least one, so the table binds), no phase, and 1×1
+/// atlases.
+#[cfg(feature = "wgpu")]
+pub(crate) fn forced_plan(markers: usize) -> GlassPlan {
+    GlassPlan {
+        rows: vec![GlassMarkerRow::default(); markers.max(1)],
+        backdrop_size: (1, 1),
+        glass_size: (1, 1),
+        ..GlassPlan::default()
+    }
+}
+
 /// Side of a fine tile in pixels, matching `TILE_WIDTH` and `TILE_HEIGHT` in `config.wgsl`.
 #[cfg(feature = "wgpu")]
 const TILE: i32 = 16;

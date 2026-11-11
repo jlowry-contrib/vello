@@ -343,6 +343,7 @@ pub struct Renderer {
     glass_resume_format: GlassResumeFormat,
     glass_atlas_format: GlassAtlasFormat,
     glass_stops_disabled: bool,
+    glass_permutation_forced: bool,
     #[cfg(feature = "debug_layers")]
     debug: debug::DebugRenderer,
     #[cfg(feature = "wgpu-profiler")]
@@ -511,6 +512,7 @@ impl Renderer {
             glass_resume_format: GlassResumeFormat::default(),
             glass_atlas_format: GlassAtlasFormat::default(),
             glass_stops_disabled: false,
+            glass_permutation_forced: false,
             #[cfg(feature = "debug_layers")]
             debug,
             #[cfg(feature = "wgpu-profiler")]
@@ -598,9 +600,13 @@ impl Renderer {
         params: &RenderParams,
         passes: &mut dyn GlassPasses,
     ) -> Result<()> {
-        let plan = glass::plan(&scene.encoding().glass, params.width, params.height);
+        let markers = &scene.encoding().glass;
+        let mut plan = glass::plan(markers, params.width, params.height);
         if plan.placements.is_empty() {
-            return self.render_to_texture(device, queue, scene, texture, params);
+            if !self.glass_permutation_forced {
+                return self.render_to_texture(device, queue, scene, texture, params);
+            }
+            plan = glass::forced_plan(markers.len());
         }
         if self.engine.use_cpu {
             log::warn!("glass.cpu.unsupported markers={}", plan.placements.len());
@@ -756,6 +762,17 @@ impl Renderer {
     #[doc(hidden)]
     pub fn set_glass_stops_disabled(&mut self, disabled: bool) {
         self.glass_stops_disabled = disabled;
+    }
+
+    /// Makes frames without placed markers run the glass fine permutation, a control for
+    /// the split bench.
+    ///
+    /// Such a frame, rendered with
+    /// [`render_to_texture_with_glass`](Self::render_to_texture_with_glass), runs phase 0
+    /// with an empty marker table and no glass phase. `render_to_texture` is unaffected.
+    #[doc(hidden)]
+    pub fn set_glass_permutation_forced(&mut self, forced: bool) {
+        self.glass_permutation_forced = forced;
     }
 
     /// Overwrite `image` with `texture`.

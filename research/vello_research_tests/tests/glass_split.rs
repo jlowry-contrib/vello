@@ -1149,3 +1149,34 @@ fn glass_state_clear_covers_only_the_header() {
         "the clear reached past the header"
     );
 }
+
+#[test]
+#[cfg_attr(skip_gpu_tests, ignore)]
+fn forced_glass_permutation_without_markers_is_identical() {
+    let scene = unmarked_scene();
+    for aa in [AaConfig::Area, AaConfig::Msaa16] {
+        let mut renderer = gpu_renderer(AaSupport::all());
+        let stock = render_frame(&mut renderer, 512, 512, aa, &scene, None);
+        renderer.set_glass_permutation_forced(true);
+        let mut capture = CaptureBackdrop::default();
+        let forced = render_frame(&mut renderer, 512, 512, aa, &scene, Some(&mut capture));
+        assert!(
+            renderer.glass_pipelines_compiled(),
+            "{aa:?}: the forced frame compiled no glass pipeline"
+        );
+        assert!(capture.frame.is_empty() && capture.frame_phases == 0);
+        assert!(capture.phases.is_empty(), "{aa:?}: a phase was recorded");
+        // No setup dispatch ran, so the header stays as cleared.
+        assert_eq!(glass_state_words(&renderer)[..8], [0; 8]);
+        let delta = max_delta(&stock, &forced);
+        // The glass permutation may round differently under fast math, by at most one level.
+        eprintln!(
+            "glass.identity forced_{aa:?} exact={} max_delta={delta}",
+            delta == 0
+        );
+        assert!(
+            delta <= 1,
+            "{aa:?}: forcing changed the output by {delta} levels"
+        );
+    }
+}

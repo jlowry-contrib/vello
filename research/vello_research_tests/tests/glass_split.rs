@@ -13,8 +13,8 @@ use vello::peniko::{Color, Fill, Mix};
 use vello::wgpu::{self, CommandEncoder, Device, Queue, util::DeviceExt};
 use vello::{AaConfig, AaSupport, Renderer, Scene};
 use vello_research_tests::glass::{
-    Atlas, CaptureBackdrop, NoGlass, background, gpu_renderer, max_delta, render_frame,
-    render_pair, render_pair_cpu, render_scene,
+    Atlas, CaptureBackdrop, NoGlass, background, gpu_renderer, max_delta, read_glass_state,
+    render_frame, render_pair, render_pair_cpu, render_scene,
 };
 
 /// How much of a test scene to build.
@@ -1093,4 +1093,59 @@ fn no_marker_scene_is_identical_through_both_entry_points() {
     let stock = frame(&mut renderer, &scene, false);
     let glass = frame(&mut renderer, &scene, true);
     assert_eq!(max_delta(&stock, &glass), 0, "entry points differ");
+}
+
+/// Sixteen disjoint markers, each composite stopping its 16 tiles for phase 1.
+fn sixteen_markers() -> Scene {
+    let mut scene = Scene::new();
+    background(&mut scene);
+    for id in 0..16 {
+        let x = 128 * (id % 4);
+        let y = 128 * (id / 4);
+        marker_with_id(
+            &mut scene,
+            id as u32,
+            rect(x + 16, y + 16, x + 112, y + 112),
+            rect(x + 32, y + 32, x + 96, y + 96),
+        );
+    }
+    scene
+}
+
+/// Returns `glass_state` as `u32` words.
+fn glass_state_words(renderer: &Renderer) -> Vec<u32> {
+    let bytes = read_glass_state(renderer);
+    bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&w| u32::from_ne_bytes(w))
+        .collect()
+}
+
+#[test]
+#[cfg_attr(skip_gpu_tests, ignore)]
+fn glass_state_clear_covers_only_the_header() {
+    // `glass_state`'s header in words: the running phase, padding, four stop counts.
+    const HEADER_WORDS: usize = 8;
+    let mut renderer = gpu_renderer(AaSupport::area_only());
+    let scene = sixteen_markers();
+    frame(&mut renderer, &scene, true);
+    let first = glass_state_words(&renderer);
+    // Phase 1 ran once and stopped 256 tiles: 16 composites of 4 × 4 tiles.
+    assert_eq!(first[..HEADER_WORDS], [1, 0, 0, 0, 256, 0, 0, 0]);
+    assert!(
+        first[HEADER_WORDS..].iter().any(|&w| w != 0),
+        "the first frame wrote no resume records"
+    );
+    // The same scene sizes `glass_state` alike, so the second frame reuses the pooled buffer.
+    renderer.set_glass_stops_disabled(true);
+    frame(&mut renderer, &scene, true);
+    let second = glass_state_words(&renderer);
+    assert_eq!(second.len(), first.len(), "the pooled buffer changed");
+    assert_eq!(second[..HEADER_WORDS], [1, 0, 0, 0, 0, 0, 0, 0]);
+    assert!(
+        second[HEADER_WORDS..] == first[HEADER_WORDS..],
+        "the clear reached past the header"
+    );
 }

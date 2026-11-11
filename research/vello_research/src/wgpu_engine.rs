@@ -118,7 +118,8 @@ struct BindMapBuffer {
 struct BindMap {
     buf_map: HashMap<ResourceId, BindMapBuffer>,
     image_map: HashMap<ResourceId, (Texture, TextureView)>,
-    pending_clears: HashSet<ResourceId>,
+    /// Clears, as `(offset, size)`, recorded before their buffer was materialized.
+    pending_clears: HashMap<ResourceId, Vec<(u64, Option<u64>)>>,
 }
 
 #[derive(Hash, PartialEq, Eq)]
@@ -251,6 +252,15 @@ impl WgpuEngine {
     /// Returns how many shaders have been added.
     pub fn shader_count(&self) -> usize {
         self.shaders.len()
+    }
+
+    /// Returns a pooled buffer named `name`, if one is free.
+    pub(crate) fn pooled_buffer(&self, name: &str) -> Option<&Buffer> {
+        self.pool
+            .bufs
+            .iter()
+            .filter(|(props, _)| props.name == name)
+            .find_map(|(_, bufs)| bufs.last())
     }
 
     /// Add a shader.
@@ -754,7 +764,11 @@ impl WgpuEngine {
                             }
                         }
                     } else {
-                        self.bind_map.pending_clears.insert(proxy.id);
+                        self.bind_map
+                            .pending_clears
+                            .entry(proxy.id)
+                            .or_default()
+                            .push((*offset, *size));
                     }
                 }
                 Command::FreeBuffer(proxy) => {
@@ -1139,8 +1153,13 @@ impl<'a> TransientBindMap<'a> {
                                 | BufferUsages::INDIRECT
                                 | BufferUsages::VERTEX;
                             let buf = pool.get_buf(proxy.size, proxy.name, usage, device);
-                            if bind_map.pending_clears.remove(&proxy.id) {
-                                encoder.clear_buffer(&buf, 0, None);
+                            for (offset, size) in bind_map
+                                .pending_clears
+                                .remove(&proxy.id)
+                                .into_iter()
+                                .flatten()
+                            {
+                                encoder.clear_buffer(&buf, offset, size);
                             }
                             v.insert(BindMapBuffer {
                                 buffer: MaterializedBuffer::Gpu(buf),

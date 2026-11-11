@@ -280,6 +280,12 @@ pub fn render_frame(
     read_texture(device, queue, &target)
 }
 
+/// Reads back `renderer`'s `glass_state` buffer from its last glass frame.
+pub fn read_glass_state(renderer: &Renderer) -> Vec<u8> {
+    let (device, queue) = &*WGPU_DEVICE_QUEUE;
+    renderer.read_glass_state(device, queue)
+}
+
 /// Reloads `renderer`'s shaders on the shared test device.
 #[cfg(feature = "hot_reload")]
 pub fn reload_shaders(renderer: &mut Renderer) {

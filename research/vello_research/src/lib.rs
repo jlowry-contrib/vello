@@ -708,6 +708,40 @@ impl Renderer {
         self.engine.shader_count()
     }
 
+    /// Reads back the `glass_state` buffer the last glass frame returned to the pool, for tests.
+    ///
+    /// Returns an empty vector if no glass frame has run.
+    ///
+    /// # Panics
+    ///
+    /// Panics if mapping the read-back buffer fails.
+    #[doc(hidden)]
+    pub fn read_glass_state(&self, device: &Device, queue: &Queue) -> Vec<u8> {
+        let Some(state) = self.engine.pooled_buffer("vello.glass_state") else {
+            return Vec::new();
+        };
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("vello.glass_state_readback"),
+            size: state.size(),
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("vello.glass_state_readback"),
+        });
+        encoder.copy_buffer_to_buffer(state, 0, &readback, 0, state.size());
+        queue.submit([encoder.finish()]);
+        let slice = readback.slice(..);
+        let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
+        slice.map_async(wgpu::MapMode::Read, move |v| sender.send(v).unwrap());
+        util::block_on_wgpu(device, receiver.receive())
+            .expect("channel was closed")
+            .expect("mapping the glass state failed");
+        let data = slice.get_mapped_range().unwrap().to_vec();
+        readback.unmap();
+        data
+    }
+
     /// Sets how fine saves its colour state when a tile stops for glass.
     pub fn set_glass_resume_format(&mut self, format: GlassResumeFormat) {
         self.glass_resume_format = format;

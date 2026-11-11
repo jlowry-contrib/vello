@@ -730,6 +730,58 @@ fn sixteen_disjoint_markers_share_one_phase() {
 /// Premultiplied glass the phase-one hook writes over marker 0's composite.
 const GLASS: [f32; 4] = [0.25, 0.0, 0.0, 0.5];
 
+/// Writes [`GLASS`] over placement `m`'s slot in `phase`'s glass atlas.
+fn write_glass(
+    device: &Device,
+    encoder: &mut CommandEncoder,
+    phase: &GlassPhase<'_>,
+    m: &MarkerPlacement,
+) {
+    let width = (m.composite.x1 - m.composite.x0) as u32;
+    let height = (m.composite.y1 - m.composite.y0) as u32;
+    // GLASS as half floats: 0.25, 0.0, 0.0 and 0.5.
+    let texel = [0x3400_u16, 0, 0, 0x3800];
+    let data: Vec<u8> = (0..width * height)
+        .flat_map(|_| texel.iter().flat_map(|c| c.to_le_bytes()))
+        .collect();
+    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("glass test G"),
+        contents: &data,
+        usage: wgpu::BufferUsages::COPY_SRC,
+    });
+    assert_eq!(
+        phase.glass_atlas.format(),
+        wgpu::TextureFormat::Rgba16Float,
+        "the default glass atlas format"
+    );
+    encoder.copy_buffer_to_texture(
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                // Eight bytes per texel; the composite is a multiple of 32 px wide.
+                bytes_per_row: Some(width * 8),
+                rows_per_image: None,
+            },
+        },
+        wgpu::TexelCopyTextureInfo {
+            texture: phase.glass_atlas,
+            mip_level: 0,
+            origin: wgpu::Origin3d {
+                x: m.glass_origin.0,
+                y: m.glass_origin.1,
+                z: 0,
+            },
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+}
+
 /// Writes [`GLASS`] into marker 0's glass slot in phase 1 and captures the backdrops.
 #[derive(Default)]
 struct WriteGlass {
@@ -744,49 +796,7 @@ impl GlassPasses for WriteGlass {
     fn record(&mut self, device: &Device, encoder: &mut CommandEncoder, phase: &GlassPhase<'_>) {
         if phase.index == 1 {
             let m0 = phase.markers.iter().find(|p| p.id == 0).unwrap();
-            let width = (m0.composite.x1 - m0.composite.x0) as u32;
-            let height = (m0.composite.y1 - m0.composite.y0) as u32;
-            // GLASS as half floats: 0.25, 0.0, 0.0 and 0.5.
-            let texel = [0x3400_u16, 0, 0, 0x3800];
-            let data: Vec<u8> = (0..width * height)
-                .flat_map(|_| texel.iter().flat_map(|c| c.to_le_bytes()))
-                .collect();
-            let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("glass test G"),
-                contents: &data,
-                usage: wgpu::BufferUsages::COPY_SRC,
-            });
-            assert_eq!(
-                phase.glass_atlas.format(),
-                wgpu::TextureFormat::Rgba16Float,
-                "the default glass atlas format"
-            );
-            encoder.copy_buffer_to_texture(
-                wgpu::TexelCopyBufferInfo {
-                    buffer: &buffer,
-                    layout: wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        // Eight bytes per texel; the composite is a multiple of 32 px wide.
-                        bytes_per_row: Some(width * 8),
-                        rows_per_image: None,
-                    },
-                },
-                wgpu::TexelCopyTextureInfo {
-                    texture: phase.glass_atlas,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d {
-                        x: m0.glass_origin.0,
-                        y: m0.glass_origin.1,
-                        z: 0,
-                    },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-            );
+            write_glass(device, encoder, phase, m0);
         }
         self.capture.record(device, encoder, phase);
     }
@@ -850,6 +860,67 @@ fn second_phase_snapshot_includes_the_first_phase_glass() {
         }
     }
     eprintln!("glass.second_phase max_delta={worst:.3}");
+}
+
+/// Writes [`GLASS`] into every marker's glass slot in every phase and captures the backdrops.
+#[derive(Default)]
+struct GlassOnEveryMarker {
+    capture: CaptureBackdrop,
+}
+
+impl GlassPasses for GlassOnEveryMarker {
+    fn prepare(&mut self, device: &Device, queue: &Queue, frame: &GlassFrame<'_>) {
+        self.capture.prepare(device, queue, frame);
+    }
+
+    fn record(&mut self, device: &Device, encoder: &mut CommandEncoder, phase: &GlassPhase<'_>) {
+        for m in phase.markers {
+            write_glass(device, encoder, phase, m);
+        }
+        self.capture.record(device, encoder, phase);
+    }
+}
+
+#[test]
+#[cfg_attr(skip_gpu_tests, ignore)]
+fn marker_past_the_phase_cap_draws_nothing() {
+    // Each composite meets the next region, so the fifth marker would need phase 5.
+    let chain = |count: i32| {
+        move |scene: &mut Scene, marked: bool| {
+            background(scene);
+            if marked {
+                for i in 0..count {
+                    let o = 64 * i;
+                    let region = rect(64 + o, 64 + o, 192 + o, 192 + o);
+                    let composite = rect(96 + o, 96 + o, 160 + o, 160 + o);
+                    marker_with_id(scene, i as u32, region, composite);
+                }
+            }
+        }
+    };
+    let render = |count: i32| {
+        let mut passes = GlassOnEveryMarker::default();
+        let (_, split) = outputs(
+            AaConfig::Area,
+            GlassResumeFormat::F32,
+            |_| {},
+            chain(count),
+            &mut passes,
+        );
+        (split, passes.capture)
+    };
+    let (four, four_capture) = render(4);
+    let (five, five_capture) = render(5);
+    let phases = |c: &CaptureBackdrop| c.frame.iter().map(|p| (p.id, p.phase)).collect::<Vec<_>>();
+    assert_eq!(phases(&four_capture), [(0, 1), (1, 2), (2, 3), (3, 4)]);
+    assert_eq!(phases(&five_capture), phases(&four_capture));
+    assert_eq!(five_capture.frame, four_capture.frame);
+    assert_eq!(five_capture.phases, [1, 2, 3, 4]);
+    assert_eq!(
+        max_delta(&four, &five),
+        0,
+        "the capped marker changed the output"
+    );
 }
 
 #[test]

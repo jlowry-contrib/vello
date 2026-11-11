@@ -5,7 +5,7 @@
 
 use crate::Transform;
 
-/// The most glass phases a frame renders; deeper markers fold into the last.
+/// The most glass phases a frame renders; deeper markers are left out.
 // The glass design's phase cap: it bounds the number of fine dispatches per frame.
 pub const MAX_GLASS_PHASES: u32 = 4;
 
@@ -219,8 +219,10 @@ pub(crate) fn composite_tile_words(composite: IRect) -> [u32; 2] {
 /// Assigns each marker its glass phase, in paint order.
 ///
 /// A marker's phase is one more than the highest phase of an earlier marker whose
-/// composite meets its region, and 1 when there is none, capped at [`MAX_GLASS_PHASES`].
-/// Returns the phases and how many markers the cap lowered.
+/// composite meets its region, and 1 when there is none. A marker that would need a
+/// phase past [`MAX_GLASS_PHASES`] gets phase 0: the frame leaves it out, so it
+/// raises no later marker's phase. Returns the phases and how many markers the cap
+/// left out.
 pub fn assign_phases(markers: &[GlassMarker]) -> (Vec<u32>, usize) {
     let mut phases: Vec<u32> = Vec::with_capacity(markers.len());
     let mut capped = 0;
@@ -235,8 +237,10 @@ pub fn assign_phases(markers: &[GlassMarker]) -> (Vec<u32>, usize) {
         let phase = below + 1;
         if phase > MAX_GLASS_PHASES {
             capped += 1;
+            phases.push(0);
+        } else {
+            phases.push(phase);
         }
-        phases.push(phase.min(MAX_GLASS_PHASES));
     }
     (phases, capped)
 }
@@ -333,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn phases_clamp_at_the_cap() {
+    fn markers_past_the_cap_are_left_out() {
         let markers: Vec<_> = (0..6)
             .map(|i| {
                 m(
@@ -351,8 +355,9 @@ mod tests {
             })
             .collect();
         let (phases, capped) = assign_phases(&snapped);
-        assert_eq!(phases, [1, 2, 3, 4, 4, 4]);
-        assert_eq!(capped, 2);
+        // The fifth is left out, so the sixth, which meets only its composite, starts over.
+        assert_eq!(phases, [1, 2, 3, 4, 0, 1]);
+        assert_eq!(capped, 1);
     }
 
     #[test]

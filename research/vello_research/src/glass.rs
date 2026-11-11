@@ -137,8 +137,9 @@ const MIN_ATLAS_WIDTH: u32 = 512;
 
 /// Lays out a frame's glass for a `width`×`height` target.
 ///
-/// Markers under more than [`MAX_GLASS_LAYERS`] open layers, or with no pixels on the
-/// target, are left out: their rows have phase 0 and they get no placement.
+/// Markers under more than [`MAX_GLASS_LAYERS`] open layers, with no pixels on the
+/// target, or past the phase cap are left out: their rows have phase 0 and they get no
+/// placement.
 #[cfg(feature = "wgpu")]
 pub(crate) fn plan(markers: &GlassMarkers, width: u32, height: u32) -> GlassPlan {
     let tiles = |r: IRect| {
@@ -170,17 +171,23 @@ pub(crate) fn plan(markers: &GlassMarkers, width: u32, height: u32) -> GlassPlan
     if capped > 0 {
         log::warn!("glass.phase.capped markers={capped} max={MAX_GLASS_PHASES}");
     }
-    let backdrop_sizes: Vec<_> = clamped.iter().map(|m| size(m.region)).collect();
-    let glass_sizes: Vec<_> = clamped.iter().map(|m| size(m.composite)).collect();
+    // (encoded index, clamped marker, phase) of each marker the frame places.
+    let kept: Vec<_> = included
+        .into_iter()
+        .zip(clamped)
+        .zip(phases)
+        .filter(|&(_, phase)| phase != 0)
+        .map(|((i, marker), phase)| (i, marker, phase))
+        .collect();
+    let backdrop_sizes: Vec<_> = kept.iter().map(|&(_, m, _)| size(m.region)).collect();
+    let glass_sizes: Vec<_> = kept.iter().map(|&(_, m, _)| size(m.composite)).collect();
     let (backdrop_origins, backdrop_size) = pack_shelves(&backdrop_sizes, MIN_ATLAS_WIDTH);
     let (glass_origins, glass_size) = pack_shelves(&glass_sizes, MIN_ATLAS_WIDTH);
     let pack = |(x, y): (u32, u32)| x | y << 16;
     let mut rows = vec![GlassMarkerRow::default(); markers.len()];
-    let mut placements = Vec::with_capacity(included.len());
+    let mut placements = Vec::with_capacity(kept.len());
     let mut capacities = [0; MAX_GLASS_PHASES as usize];
-    for (j, &i) in included.iter().enumerate() {
-        let marker = clamped[j];
-        let phase = phases[j];
+    for (j, &(i, marker, phase)) in kept.iter().enumerate() {
         let composite = tiles(marker.composite);
         capacities[phase as usize - 1] +=
             (composite[2] - composite[0]) * (composite[3] - composite[1]);
@@ -203,9 +210,9 @@ pub(crate) fn plan(markers: &GlassMarkers, width: u32, height: u32) -> GlassPlan
     }
     placements.sort_by_key(|p| p.phase);
     GlassPlan {
+        phases: placements.last().map_or(0, |p| p.phase),
         placements,
         rows,
-        phases: phases.iter().copied().max().unwrap_or(0),
         backdrop_size,
         glass_size,
         capacities,
@@ -264,6 +271,23 @@ mod tests {
         assert_eq!(plan.rows[0].phase, 0);
         assert_eq!(plan.rows[1].phase, 0);
         assert_eq!(plan.rows[2].phase, 1);
+    }
+
+    #[test]
+    fn markers_past_the_phase_cap_get_phase_zero_rows() {
+        let chain: Vec<_> = (0..5)
+            .map(|i| {
+                let o = 64 * i;
+                let region = r(64 + o, 64 + o, 192 + o, 192 + o);
+                (i as u32, region, r(96 + o, 96 + o, 160 + o, 160 + o), 0)
+            })
+            .collect();
+        let plan = plan(&markers(&chain), 512, 512);
+        let ids: Vec<_> = plan.placements.iter().map(|p| (p.id, p.phase)).collect();
+        assert_eq!(ids, [(0, 1), (1, 2), (2, 3), (3, 4)]);
+        assert_eq!(plan.phases, 4);
+        assert_eq!(plan.rows[4], super::GlassMarkerRow::default());
+        assert_eq!(plan.capacities, [16; 4]);
     }
 
     #[test]

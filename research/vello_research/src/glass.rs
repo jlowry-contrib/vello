@@ -130,6 +130,10 @@ pub(crate) fn phase_placements(placements: &[MarkerPlacement], index: u32) -> &[
 /// Lays out a frame that runs the glass permutation with no glass: a zeroed marker table
 /// with a row per encoded marker (at least one, so the table binds), no phase, and 1×1
 /// atlases.
+///
+/// The atlases only grow and are reused across frames, as is the pooled `glass_state`, so
+/// after an earlier glass frame the forced frame binds those larger resources. Without
+/// markers, fine samples neither atlas and reads only the state header.
 #[cfg(feature = "wgpu")]
 pub(crate) fn forced_plan(markers: usize) -> GlassPlan {
     GlassPlan {

@@ -24,7 +24,7 @@ use skrifa::{
 use vello_encoding::BumpAllocatorMemory;
 use vello_encoding::{
     DrawBeginClip, Encoding, FontEmbolden, GlassMarker, GlassSkip, Glyph, GlyphRun,
-    MAX_GLASS_LAYERS, NormalizedCoord, Patch, Transform,
+    MAX_GLASS_LAYERS, MAX_VIBRANT_MATRICES, NormalizedCoord, Patch, Transform, VibrantMatrix,
 };
 
 // TODO - Document invariants and edge cases (#470)
@@ -187,10 +187,68 @@ impl Scene {
         self.push_layer_inner(DrawBeginClip::clip(), clip_style.into(), transform, clip);
     }
 
+    /// Pushes a plus-darker layer clipped by the specified `clip` shape, filled with the
+    /// non-zero rule.
+    ///
+    /// When the layer is popped, its content `s` composites onto the backdrop `b` as
+    /// `max(0, s + b − 1)`, in the Porter–Duff form for premultiplied colours:
+    /// `ra = min(1, as + ab)` and `rc = max(0, ra − (as·(1 − cs) + ab·(1 − cb)))`.
+    ///
+    /// The `transform` applies only to the `clip` shape, as for [`push_layer`](Self::push_layer).
+    pub fn push_layer_plus_darker(&mut self, alpha: f32, transform: Affine, clip: &impl Shape) {
+        self.push_layer_inner(
+            DrawBeginClip::plus_darker(alpha.clamp(0.0, 1.0)),
+            Fill::NonZero.into(),
+            transform,
+            clip,
+        );
+    }
+
+    /// Pushes a vibrant layer clipped by the specified `clip` shape, filled with the
+    /// non-zero rule.
+    ///
+    /// The layer's content isn't drawn: its alpha, times `alpha` and the clip's coverage,
+    /// weights a mix of the backdrop towards `matrix` applied to the backdrop. The matrix
+    /// acts on the un-premultiplied backdrop `[r, g, b, a, 1]`, and its output is clamped
+    /// to [`VibrantMatrix::clamp`], then to `[0, 1]`, and premultiplied again.
+    ///
+    /// A scene holds up to [`MAX_VIBRANT_MATRICES`] distinct matrices. A layer past that
+    /// blends normally and is logged as `glass.vibrant.too_many`.
+    ///
+    /// The `transform` applies only to the `clip` shape, as for [`push_layer`](Self::push_layer).
+    ///
+    /// [`MAX_VIBRANT_MATRICES`]: vello_encoding::MAX_VIBRANT_MATRICES
+    pub fn push_vibrant_layer(
+        &mut self,
+        matrix: VibrantMatrix,
+        alpha: f32,
+        transform: Affine,
+        clip: &impl Shape,
+    ) {
+        self.encode_layer_clip(Fill::NonZero.into(), transform, clip);
+        if !self
+            .encoding
+            .encode_vibrant_begin_clip(&matrix, alpha.clamp(0.0, 1.0))
+        {
+            log::warn!("glass.vibrant.too_many layers=1 max={MAX_VIBRANT_MATRICES}");
+        }
+    }
+
     /// Helper for logic shared between [`Self::push_layer`] and [`Self::push_luminance_mask_layer`]
     fn push_layer_inner<'a>(
         &mut self,
         parameters: DrawBeginClip,
+        clip_style: StyleRef<'a>,
+        transform: Affine,
+        clip: &impl Shape,
+    ) {
+        self.encode_layer_clip(clip_style, transform, clip);
+        self.encoding.encode_begin_clip(parameters);
+    }
+
+    /// Encodes a layer's clip path, or an empty path if the shape is invalid.
+    fn encode_layer_clip<'a>(
+        &mut self,
         clip_style: StyleRef<'a>,
         transform: Affine,
         clip: &impl Shape,
@@ -233,7 +291,6 @@ impl Scene {
                     .count_path(path.into_iter(), &Transform::IDENTITY, None);
             }
         }
-        self.encoding.encode_begin_clip(parameters);
     }
 
     /// Pops the current layer.
@@ -483,10 +540,17 @@ impl Scene {
     /// This is an O(N) operation.
     ///
     /// The child's glass markers are left out, and logged, if `transform` is not an integer
-    /// translation.
+    /// translation. The child's vibrant layers whose matrices don't fit in this scene's
+    /// table blend normally, and are logged.
     pub fn append(&mut self, other: &Self, transform: Option<Affine>) {
         let t = transform.as_ref().map(Transform::from_kurbo);
         let first_marker = self.encoding.glass.len();
+        let vibrant_overflow = self.encoding.vibrant.overflow(&other.encoding.vibrant);
+        if vibrant_overflow > 0 {
+            log::warn!(
+                "glass.vibrant.too_many matrices={vibrant_overflow} max={MAX_VIBRANT_MATRICES}"
+            );
+        }
         if let Err(GlassSkip::NonIntegerTransform) = self.encoding.append(&other.encoding, &t) {
             log::warn!(
                 "glass.append.non_integer markers={}",

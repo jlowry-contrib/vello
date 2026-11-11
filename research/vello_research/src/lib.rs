@@ -146,7 +146,9 @@ use peniko::ImageData;
 pub use wgpu;
 
 pub use scene::{DrawGlyphs, Scene};
-pub use vello_encoding::{FontEmbolden, Glyph, NormalizedCoord};
+pub use vello_encoding::{
+    COMPOSE_PLUS_DARKER, FontEmbolden, Glyph, MAX_VIBRANT_MATRICES, NormalizedCoord, VibrantMatrix,
+};
 
 use low_level::ShaderId;
 #[cfg(feature = "wgpu")]
@@ -352,6 +354,9 @@ pub struct Renderer {
     glass_lite_commands_counted: bool,
     glass_state_limit_for_tests: Option<u64>,
     glass_capacity_for_tests: (Option<u32>, Option<u32>),
+    /// The vibrant table bound to frames without vibrant layers: one identity matrix, made
+    /// once so those frames upload nothing.
+    vibrant_identity: (recording::BufferProxy, wgpu::Buffer),
     #[cfg(feature = "debug_layers")]
     debug: debug::DebugRenderer,
     #[cfg(feature = "wgpu-profiler")]
@@ -511,6 +516,19 @@ impl Renderer {
         engine.build_shaders_if_needed(device, options.num_init_threads);
         #[cfg(feature = "debug_layers")]
         let debug = debug::DebugRenderer::new(device, wgpu::TextureFormat::Rgba8Unorm, &mut engine);
+        let identity = VibrantMatrix::IDENTITY.gpu_words();
+        let identity: &[u8] = bytemuck::cast_slice(&identity);
+        let vibrant_identity = (
+            recording::BufferProxy::new(identity.len() as u64, "vello.vibrant_identity"),
+            wgpu::util::DeviceExt::create_buffer_init(
+                device,
+                &wgpu::util::BufferInitDescriptor {
+                    label: Some("vello.vibrant_identity"),
+                    contents: identity,
+                    usage: wgpu::BufferUsages::STORAGE,
+                },
+            ),
+        );
 
         Ok(Self {
             options,
@@ -532,6 +550,7 @@ impl Renderer {
             glass_lite_commands_counted: false,
             glass_state_limit_for_tests: None,
             glass_capacity_for_tests: (None, None),
+            vibrant_identity,
             #[cfg(feature = "debug_layers")]
             debug,
             #[cfg(feature = "wgpu-profiler")]
@@ -569,11 +588,12 @@ impl Renderer {
             &self.shaders,
             &mut self.image_atlas,
             params,
+            self.vibrant_identity.0,
         );
-        let external_resources = [ExternalResource::Image(
-            *target.as_image().unwrap(),
-            texture,
-        )];
+        let external_resources = [
+            ExternalResource::Image(*target.as_image().unwrap(), texture),
+            ExternalResource::Buffer(self.vibrant_identity.0, &self.vibrant_identity.1),
+        ];
         self.engine.run_recording(
             device,
             queue,
@@ -726,6 +746,7 @@ impl Renderer {
             &mut self.image_atlas,
             params,
             &glass,
+            self.vibrant_identity.0,
         );
         let (backdrop, backdrop_view) = self.glass_backdrop.as_ref().unwrap();
         let (glass_atlas, glass_view) = self.glass_atlas.as_ref().unwrap();
@@ -733,6 +754,7 @@ impl Renderer {
             ExternalResource::Image(*target.as_image().unwrap(), texture),
             ExternalResource::Image(backdrop_proxy, backdrop_view),
             ExternalResource::Image(glass_proxy, glass_view),
+            ExternalResource::Buffer(self.vibrant_identity.0, &self.vibrant_identity.1),
         ];
         let mut external = ExternalPasses {
             passes,
@@ -1075,7 +1097,7 @@ impl Renderer {
         texture: &TextureView,
         params: &RenderParams,
     ) -> Result<RenderResult> {
-        let mut render = Render::new();
+        let mut render = Render::with_vibrant_identity(self.vibrant_identity.0);
         let encoding = scene.encoding();
         // TODO: turn this on; the download feature interacts with CPU dispatch.
         // Currently this is always enabled when the `debug_layers` setting is enabled as the bump
@@ -1119,7 +1141,10 @@ impl Renderer {
         // Maybe clear to reuse allocation?
         let mut recording = Recording::default();
         render.record_fine(&self.shaders, &mut recording);
-        let external_resources = [ExternalResource::Image(target, texture)];
+        let external_resources = [
+            ExternalResource::Image(target, texture),
+            ExternalResource::Buffer(self.vibrant_identity.0, &self.vibrant_identity.1),
+        ];
         self.engine.run_recording(
             device,
             queue,

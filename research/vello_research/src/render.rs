@@ -12,7 +12,8 @@ use crate::Scene;
 use crate::glass::{GlassMarkerRow, MAX_GLASS_PHASES};
 
 use vello_encoding::{
-    Encoding, GLASS_MARKER_SKIP, Resolver, WorkgroupSize, make_mask_lut, make_mask_lut_16,
+    Encoding, GLASS_MARKER_SKIP, Resolver, VibrantMatrix, WorkgroupSize, make_mask_lut,
+    make_mask_lut_16,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -27,6 +28,8 @@ pub struct Render {
     fine_wg_count: Option<WorkgroupSize>,
     fine_resources: Option<FineResources>,
     mask_buf: Option<ResourceProxy>,
+    /// A persistent one-identity vibrant table, bound when the scene has no vibrant layers.
+    vibrant_identity: Option<BufferProxy>,
 
     #[cfg(feature = "debug_layers")]
     captured_buffers: Option<CapturedBuffers>,
@@ -54,6 +57,9 @@ struct FineResources {
     info_bin_data_buf: ResourceProxy,
     image_atlas: ResourceProxy,
     blend_spill_buf: ResourceProxy,
+    /// The vibrant matrix table, and whether this render uploaded it.
+    vibrant_buf: ResourceProxy,
+    vibrant_uploaded: bool,
 
     out_image: ImageProxy,
 }
@@ -90,8 +96,16 @@ pub(crate) fn render_full(
     shaders: &FullShaders,
     image_atlas: &mut Option<ImageProxy>,
     params: &RenderParams,
+    vibrant_identity: BufferProxy,
 ) -> (Recording, ResourceProxy) {
-    render_encoding_full(scene.encoding(), resolver, shaders, image_atlas, params)
+    render_encoding_full(
+        scene.encoding(),
+        resolver,
+        shaders,
+        image_atlas,
+        params,
+        vibrant_identity,
+    )
 }
 
 /// Size of `glass_state`'s header, which is zeroed each frame: the running phase, list 0's
@@ -196,8 +210,9 @@ pub(crate) fn render_full_glass(
     image_atlas: &mut Option<ImageProxy>,
     params: &RenderParams,
     glass: &GlassRender<'_>,
+    vibrant_identity: BufferProxy,
 ) -> (Recording, ResourceProxy) {
-    let mut render = Render::new();
+    let mut render = Render::with_vibrant_identity(vibrant_identity);
     let mut recording = render.render_encoding_coarse_inner(
         scene.encoding(),
         resolver,
@@ -223,8 +238,9 @@ pub(crate) fn render_encoding_full(
     shaders: &FullShaders,
     image_atlas: &mut Option<ImageProxy>,
     params: &RenderParams,
+    vibrant_identity: BufferProxy,
 ) -> (Recording, ResourceProxy) {
-    let mut render = Render::new();
+    let mut render = Render::with_vibrant_identity(vibrant_identity);
     let mut recording =
         render.render_encoding_coarse(encoding, resolver, shaders, image_atlas, params, false);
     let out_image = render.out_image();
@@ -244,8 +260,22 @@ impl Render {
             fine_wg_count: None,
             fine_resources: None,
             mask_buf: None,
+            vibrant_identity: None,
             #[cfg(feature = "debug_layers")]
             captured_buffers: None,
+        }
+    }
+
+    /// Creates a render that binds `identity` as the vibrant table of scenes without vibrant
+    /// layers.
+    ///
+    /// `identity` must hold [`VibrantMatrix::IDENTITY`](vello_encoding::VibrantMatrix::IDENTITY)
+    /// in its GPU layout, and the caller binds it as an external buffer. A render without
+    /// one uploads an identity table each frame.
+    pub fn with_vibrant_identity(identity: BufferProxy) -> Self {
+        Self {
+            vibrant_identity: Some(identity),
+            ..Self::new()
         }
     }
 
@@ -676,6 +706,18 @@ impl Render {
             buffer_sizes.blend_spill.size_in_bytes().into(),
             "vello.blend_spill",
         );
+        let (vibrant_buf, vibrant_uploaded) = match self.vibrant_identity {
+            Some(identity) if encoding.vibrant.is_empty() => (identity, false),
+            _ => {
+                let table = if encoding.vibrant.is_empty() {
+                    VibrantMatrix::IDENTITY.gpu_words().to_vec()
+                } else {
+                    encoding.vibrant.gpu_table()
+                };
+                let buf = recording.upload("vello.vibrant", bytemuck::cast_slice(&table));
+                (buf, true)
+            }
+        };
         self.fine_wg_count = Some(wg_counts.fine);
         self.fine_resources = Some(FineResources {
             aa_config: params.antialiasing_method,
@@ -687,6 +729,8 @@ impl Render {
             gradient_image,
             info_bin_data_buf,
             blend_spill_buf: ResourceProxy::Buffer(blend_spill_buf),
+            vibrant_buf: ResourceProxy::Buffer(vibrant_buf),
+            vibrant_uploaded,
             image_atlas: ResourceProxy::Image(image_atlas),
             out_image,
         });
@@ -775,6 +819,7 @@ impl Render {
                     ResourceProxy::Image(fine.out_image),
                     fine.gradient_image,
                     fine.image_atlas,
+                    fine.vibrant_buf,
                 ];
                 (
                     shader.expect("shaders not configured to support AA mode: area"),
@@ -828,6 +873,7 @@ impl Render {
                     fine.gradient_image,
                     fine.image_atlas,
                     self.mask_buf.unwrap(),
+                    fine.vibrant_buf,
                 ];
                 (
                     fine_shader,
@@ -844,7 +890,8 @@ impl Render {
             self.free_fine(recording, fine);
             return;
         };
-        // The lite pass binds stock fine's resources, then the glass state.
+        // The lite pass binds stock fine's resources and the vibrant table, then the glass
+        // state.
         let stock_count = resources.len() - GLASS_FINE_RESOURCES;
         let lite_resources = resources[..stock_count]
             .iter()
@@ -898,6 +945,9 @@ impl Render {
         recording.free_resource(fine.gradient_image);
         recording.free_resource(fine.info_bin_data_buf);
         recording.free_resource(fine.blend_spill_buf);
+        if fine.vibrant_uploaded {
+            recording.free_resource(fine.vibrant_buf);
+        }
         // TODO: make mask buf persistent
         if let Some(mask_buf) = self.mask_buf.take() {
             recording.free_resource(mask_buf);

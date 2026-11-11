@@ -194,6 +194,12 @@ pub struct DrawBlurRoundedRect {
     pub std_dev: f32,
 }
 
+/// The compose mode of a plus-darker layer, in a `BEGIN_CLIP`'s blend word.
+///
+/// peniko's `Compose` ends at 13, so this mode is reached only through
+/// `DrawBeginClip::plus_darker`. Mirrors `COMPOSE_PLUS_DARKER` in `blend.wgsl`.
+pub const COMPOSE_PLUS_DARKER: u32 = 14;
+
 /// Draw data for a clip or layer.
 #[derive(Clone, Copy, Debug, Default, Zeroable, Pod)]
 #[repr(C)]
@@ -218,6 +224,15 @@ impl DrawBeginClip {
     /// for legacy reasons.
     /// We expect this to change in the future.
     pub const CLIP_BLEND_MODE: u32 = 0x8003;
+    /// The `blend_mode` bit that marks a vibrant layer, whose matrix index sits at
+    /// [`VIBRANT_INDEX_SHIFT`](Self::VIBRANT_INDEX_SHIFT).
+    ///
+    /// Bit 16 is the luminance mask's; peniko's modes use the low 16 bits.
+    pub const VIBRANT_BLEND_MODE: u32 = 1 << 18;
+    /// The shift of a vibrant layer's 8-bit matrix index in its `blend_mode`.
+    pub const VIBRANT_INDEX_SHIFT: u32 = 19;
+    /// The `blend_mode` of a normal source-over layer, `Mix::Normal` with `Compose::SrcOver`.
+    pub const NORMAL_BLEND_MODE: u32 = 3;
 
     /// Creates new clip draw data for a Porter-Duff blend mode.
     pub fn new(blend_mode: BlendMode, alpha: f32) -> Self {
@@ -231,6 +246,32 @@ impl DrawBeginClip {
     pub fn luminance_mask(alpha: f32) -> Self {
         Self {
             blend_mode: Self::LUMINANCE_MASK_BLEND_MODE,
+            alpha,
+        }
+    }
+
+    /// Creates the clip draw data for a plus-darker layer.
+    pub fn plus_darker(alpha: f32) -> Self {
+        Self {
+            blend_mode: COMPOSE_PLUS_DARKER,
+            alpha,
+        }
+    }
+
+    /// Returns the `blend_mode` of a vibrant layer using matrix `index`.
+    ///
+    /// The low bits hold normal source-over, the mode a reader that ignores the vibrant
+    /// bit would apply.
+    pub const fn vibrant_blend_mode(index: u32) -> u32 {
+        Self::VIBRANT_BLEND_MODE
+            | (index & 0xff) << Self::VIBRANT_INDEX_SHIFT
+            | Self::NORMAL_BLEND_MODE
+    }
+
+    /// Creates the clip draw data for a vibrant layer using matrix `index`.
+    pub fn vibrant(index: u32, alpha: f32) -> Self {
+        Self {
+            blend_mode: Self::vibrant_blend_mode(index),
             alpha,
         }
     }

@@ -215,6 +215,8 @@ const COMPOSE_DEST_ATOP = 10u;
 const COMPOSE_XOR = 11u;
 const COMPOSE_PLUS = 12u;
 const COMPOSE_PLUS_LIGHTER = 13u;
+// Past peniko's `Compose`; mirrors `COMPOSE_PLUS_DARKER` in `vello_encoding`.
+const COMPOSE_PLUS_DARKER = 14u;
 
 // Apply general compositing operation.
 // Inputs are separated colors and alpha, output is premultiplied.
@@ -278,6 +280,11 @@ fn blend_compose(
         }
         case COMPOSE_PLUS_LIGHTER: {
             return min(vec4(1.0), vec4(as_ * cs + ab * cb, as_ + ab));
+        }
+        case COMPOSE_PLUS_DARKER: {
+            // The Porter–Duff plus-darker: max(0, s + b - 1) for opaque colours.
+            let ra = min(1.0, as_ + ab);
+            return vec4(max(vec3(0.0), ra - (as_ * (1.0 - cs) + ab * (1.0 - cb))), ra);
         }
         default: {}
     }

@@ -30,6 +30,10 @@ const IMAGE_QUALITY_MEDIUM = 1u;
 const IMAGE_QUALITY_HIGH = 2u;
 
 const LUMINANCE_MASK_LAYER = 0x10000u;
+// A vibrant layer's blend word: this bit, and the matrix index in bits 19..27. Mirrors
+// `DrawBeginClip::VIBRANT_BLEND_MODE` and `VIBRANT_INDEX_SHIFT`.
+const VIBRANT_LAYER = 0x40000u;
+const VIBRANT_INDEX_SHIFT = 19u;
 
 @group(0) @binding(2)
 var<storage> ptcl: array<u32>;
@@ -75,6 +79,25 @@ var<storage> mask_lut: array<u32, 2048u>;
 
 #endif
 
+// The vibrant matrix table, bound to every permutation right after stock fine's resources.
+#ifdef msaa
+const VIBRANT_INDEX: u32 = 9;
+#else
+const VIBRANT_INDEX: u32 = 8;
+#endif
+
+// One vibrant layer matrix; mirrors `VibrantMatrix::gpu_words` in `vello_encoding`.
+struct VibrantMatrix {
+    // Output channel i is dot(rows[i], [r, g, b, a]) + offset[i].
+    rows: array<vec4<f32>, 4>,
+    offset: vec4<f32>,
+    // The clamp bounds in x and y, applied before [0, 1].
+    bounds: vec4<f32>,
+}
+
+@group(0) @binding(VIBRANT_INDEX)
+var<storage> vibrant: array<VibrantMatrix>;
+
 // `glass_state` header, in words; mirrors `GLASS_STATE_HEADER_SIZE` in `vello`'s `render.rs`.
 // [0] the running phase, which `glass_resume_setup` increments before each resume dispatch.
 const GLASS_STATE_PHASE = 0u;
@@ -90,12 +113,12 @@ const GLASS_STATE_STOPS = 4u;
 // [8..) list 0, then the tile lists of phases 1..4, then their resume records.
 const GLASS_STATE_TILES = 8u;
 
-// The lite permutations bind only `glass_state`, after the MSAA mask LUT when there is one.
+// The lite permutations add only `glass_state`, after the vibrant table.
 #ifdef lite
 #ifdef msaa
-const GLASS_STATE_INDEX: u32 = 9;
+const GLASS_STATE_INDEX: u32 = 10;
 #else
-const GLASS_STATE_INDEX: u32 = 8;
+const GLASS_STATE_INDEX: u32 = 9;
 #endif
 
 @group(0) @binding(GLASS_STATE_INDEX)
@@ -117,18 +140,18 @@ fn glass_count_lite_commands(commands: u32) {
 #endif
 #endif
 
-// Glass bindings, after the MSAA mask LUT when there is one.
+// Glass bindings, after the vibrant table.
 #ifdef glass
 #ifdef msaa
+const GLASS_MARKERS_INDEX: u32 = 10;
+const GLASS_STATE_INDEX: u32 = 11;
+const GLASS_BACKDROP_INDEX: u32 = 12;
+const GLASS_ATLAS_INDEX: u32 = 13;
+#else
 const GLASS_MARKERS_INDEX: u32 = 9;
 const GLASS_STATE_INDEX: u32 = 10;
 const GLASS_BACKDROP_INDEX: u32 = 11;
 const GLASS_ATLAS_INDEX: u32 = 12;
-#else
-const GLASS_MARKERS_INDEX: u32 = 8;
-const GLASS_STATE_INDEX: u32 = 9;
-const GLASS_BACKDROP_INDEX: u32 = 10;
-const GLASS_ATLAS_INDEX: u32 = 11;
 #endif
 
 // One row of the glass marker table; mirrors `GlassMarkerRow` in `vello`.
@@ -1204,9 +1227,23 @@ fn bicubic_sample(
 
 const PIXELS_PER_THREAD = 4u;
 
+// Mixes `bg` towards its vibrant matrix `index` applied to it, by `weight`: the matrix acts on
+// the un-premultiplied colour and its clamped output is premultiplied again.
+fn vibrant_mix(bg: vec4<f32>, weight: f32, index: u32) -> vec4<f32> {
+    let m = vibrant[index & 0xffu];
+    let c = vec4(unpremultiply(bg), bg.a);
+    let v = vec4(dot(m.rows[0], c), dot(m.rows[1], c), dot(m.rows[2], c), dot(m.rows[3], c)) + m.offset;
+    let out = clamp(clamp(v, vec4(m.bounds.x), vec4(m.bounds.y)), vec4(0.0), vec4(1.0));
+    return mix(bg, vec4(out.rgb * out.a, out.a), weight);
+}
+
 // Closes a layer: mixes its content `fg_layer`, clipped by `area` and faded by `alpha`, into `bg`.
 fn end_clip_mix(bg: vec4<f32>, fg_layer: vec4<f32>, area: f32, alpha: f32, blend: u32) -> vec4<f32> {
     let fg = fg_layer * area * alpha;
+    // Tested first: `blend_mix_compose` would read the index bits as a mix mode.
+    if (blend & VIBRANT_LAYER) != 0u {
+        return vibrant_mix(bg, fg.a, blend >> VIBRANT_INDEX_SHIFT);
+    }
     if blend == LUMINANCE_MASK_LAYER {
         // TODO: Does this case apply more generally?
         // See https://github.com/linebender/vello/issues/1061

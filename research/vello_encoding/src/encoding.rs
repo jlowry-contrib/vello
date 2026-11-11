@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 use crate::DrawBeginClip;
+use crate::VibrantMatrix;
 use crate::glass::{GlassMarker, GlassMarkers, GlassSkip, MAX_GLASS_LAYERS, composite_tile_words};
+use crate::vibrant::VibrantMatrices;
 
 use super::{
     DrawBlurRoundedRect, DrawColor, DrawImage, DrawLinearGradient, DrawRadialGradient,
@@ -53,6 +55,8 @@ pub struct Encoding {
     pub flags: u32,
     /// Glass markers, in paint order.
     pub glass: GlassMarkers,
+    /// The distinct matrices of the vibrant layers.
+    pub vibrant: VibrantMatrices,
 }
 
 impl Encoding {
@@ -92,6 +96,7 @@ impl Encoding {
         self.flags = 0;
         self.resources.reset();
         self.glass.clear();
+        self.vibrant.clear();
     }
 
     /// Appends another encoding to this one with an optional transform.
@@ -175,6 +180,8 @@ impl Encoding {
             depth_base,
             transform.as_ref(),
         );
+        self.vibrant
+            .append(&other.vibrant, &mut self.draw_data, draw_data_base);
         self.n_paths += other.n_paths;
         self.n_path_segments += other.n_path_segments;
         self.n_clips += other.n_clips;
@@ -505,6 +512,22 @@ impl Encoding {
             .extend_from_slice(bytemuck::cast_slice(bytemuck::bytes_of(&parameters)));
         self.n_clips += 1;
         self.n_open_clips += 1;
+    }
+
+    /// Encodes the begin clip command of a vibrant layer using `matrix`.
+    ///
+    /// Returns `false` if the encoding already holds [`MAX_VIBRANT_MATRICES`] other
+    /// matrices; the layer then blends normally.
+    ///
+    /// [`MAX_VIBRANT_MATRICES`]: crate::MAX_VIBRANT_MATRICES
+    pub fn encode_vibrant_begin_clip(&mut self, matrix: &VibrantMatrix, alpha: f32) -> bool {
+        let Some(index) = self.vibrant.index(matrix) else {
+            self.encode_begin_clip(DrawBeginClip::new(peniko::BlendMode::default(), alpha));
+            return false;
+        };
+        self.vibrant.push_layer(self.draw_data.len());
+        self.encode_begin_clip(DrawBeginClip::vibrant(index, alpha));
+        true
     }
 
     /// Encodes an end clip command.

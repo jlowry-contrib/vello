@@ -88,6 +88,18 @@ const FINE_RESOURCES: [BindType; 9] = [
     BindType::BufReadOnly,
 ];
 
+/// Returns the bindings every fine permutation starts with: stock fine's, the mask LUT
+/// with `msaa`, then the vibrant matrix table.
+#[cfg(feature = "wgpu")]
+fn fine_resources(msaa: bool) -> Vec<BindType> {
+    let stock = if msaa {
+        &FINE_RESOURCES[..]
+    } else {
+        &FINE_RESOURCES[..FINE_RESOURCES.len() - 1]
+    };
+    [stock, &[BindType::BufReadOnly]].concat()
+}
+
 /// Builds the glass fine permutations for the AA modes in `aa_support`, and the dispatch setups.
 ///
 /// With `lite_counted`, the lite permutations count their commands in `glass_state`, for tests.
@@ -111,20 +123,20 @@ pub(crate) fn glass_shaders(
         engine.add_compute_shader(device, label, source, bindings, CpuShaderType::Missing)
     };
 
-    // Marker table, glass state, backdrop atlas and glass atlas, after the mask LUT if any.
+    // Marker table, glass state, backdrop atlas and glass atlas, after the vibrant table.
     let glass_resources = [
         BufReadOnly,
         Buffer,
         Image(ImageFormat::Rgba8),
         ImageRead(ImageFormat::Rgba8),
     ];
-    let area_resources = &FINE_RESOURCES[..FINE_RESOURCES.len() - 1];
-    let area = [area_resources, &glass_resources].concat();
-    let msaa = [&FINE_RESOURCES[..], &glass_resources].concat();
+    let (area_resources, msaa_resources) = (fine_resources(false), fine_resources(true));
+    let area = [&area_resources[..], &glass_resources].concat();
+    let msaa = [&msaa_resources[..], &glass_resources].concat();
 
     // The lite permutations bind stock fine's resources plus the glass state.
-    let area_lite = [area_resources, &[Buffer]].concat();
-    let msaa_lite = [&FINE_RESOURCES[..], &[Buffer]].concat();
+    let area_lite = [&area_resources[..], &[Buffer]].concat();
+    let msaa_lite = [&msaa_resources[..], &[Buffer]].concat();
 
     let [fine_area_lite, fine_area_start, fine_area_resume] = if aa_support.area {
         [
@@ -414,8 +426,8 @@ pub(crate) fn full_shaders(
             Buffer,
         ]
     );
-    let fine_resources = FINE_RESOURCES;
-    let area_resources = &fine_resources[..fine_resources.len() - 1];
+    let area_resources = fine_resources(false);
+    let msaa_resources = fine_resources(true);
 
     let aa_support = &options.antialiasing_support;
     let fine_area = if aa_support.area {
@@ -430,7 +442,7 @@ pub(crate) fn full_shaders(
     let fine_msaa8 = if aa_support.msaa8 {
         Some(add_shader!(
             fine_msaa8,
-            fine_resources,
+            msaa_resources,
             CpuShaderType::Missing
         ))
     } else {
@@ -439,7 +451,7 @@ pub(crate) fn full_shaders(
     let fine_msaa16 = if aa_support.msaa16 {
         Some(add_shader!(
             fine_msaa16,
-            fine_resources,
+            msaa_resources,
             CpuShaderType::Missing
         ))
     } else {

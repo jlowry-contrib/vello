@@ -4,10 +4,11 @@
 //! Deterministic scenes and helpers for the glass tests.
 
 use std::num::NonZeroUsize;
+use std::path::{Path, PathBuf};
 
 use vello::glass::{GlassFrame, GlassPasses, GlassPhase, GlassResumeFormat, MarkerPlacement};
-use vello::kurbo::{Affine, Rect};
-use vello::peniko::{Color, Fill, Gradient, color::palette};
+use vello::kurbo::{Affine, Circle, Rect};
+use vello::peniko::{Color, Fill, Gradient, Mix, color::palette};
 use vello::util::block_on_wgpu;
 use vello::wgpu::{self, CommandEncoder, Device, Queue, Texture};
 use vello::{AaConfig, AaSupport, RenderParams, Renderer, RendererOptions, Scene};
@@ -71,6 +72,82 @@ pub fn background(scene: &mut Scene) {
             &Rect::new(x, y, x + w, y + h),
         );
     }
+}
+
+/// Width and height of the `glass_baseline` scenes, in pixels.
+pub const BASELINE_SIZE: u32 = 512;
+
+fn layer(scene: &mut Scene, alpha: f32, clip: Rect) {
+    scene.push_layer(Fill::NonZero, Mix::Normal, alpha, Affine::IDENTITY, &clip);
+}
+
+/// Returns the `glass_baseline` scenes, by name: stock content whose upstream renders are
+/// saved under `target/glass-baseline`.
+pub fn baseline_scenes() -> [(&'static str, Scene); 4] {
+    let mut plain = Scene::new();
+    background(&mut plain);
+
+    let mut half = Scene::new();
+    background(&mut half);
+    layer(&mut half, 0.5, Rect::new(64.0, 64.0, 448.0, 448.0));
+    half.fill(
+        Fill::NonZero,
+        Affine::IDENTITY,
+        Color::from_rgba8(20, 60, 220, 255),
+        None,
+        &Circle::new((256.0, 256.0), 220.0),
+    );
+    half.pop_layer();
+
+    let mut nested = Scene::new();
+    background(&mut nested);
+    for i in 0..5_u8 {
+        let inset = 24.0 + 32.0 * f64::from(i);
+        layer(
+            &mut nested,
+            0.9,
+            Rect::new(inset, inset, 512.0 - inset, 512.0 - inset),
+        );
+        nested.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            Color::from_rgba8(40 * i, 90, 200 - 30 * i, 160),
+            None,
+            &Rect::new(inset, inset, 256.0, 512.0 - inset),
+        );
+    }
+    for _ in 0..5 {
+        nested.pop_layer();
+    }
+
+    let mut circle = Scene::new();
+    background(&mut circle);
+    circle.push_clip_layer(
+        Fill::NonZero,
+        Affine::IDENTITY,
+        &Circle::new((256.0, 256.0), 180.0),
+    );
+    circle.fill(
+        Fill::NonZero,
+        Affine::translate((40.0, -30.0)),
+        Color::from_rgba8(250, 200, 40, 255),
+        None,
+        &Rect::new(0.0, 0.0, 512.0, 512.0),
+    );
+    circle.pop_layer();
+
+    [
+        ("background", plain),
+        ("half-layer", half),
+        ("nested-layers", nested),
+        ("circle-clip", circle),
+    ]
+}
+
+/// Returns where the baseline render of scene `name` under AA mode `aa` is saved, relative
+/// to this crate's directory.
+pub fn baseline_path(name: &str, aa: &str) -> PathBuf {
+    Path::new("target/glass-baseline").join(format!("{name}-{aa}.png"))
 }
 
 /// An atlas read back from the GPU: `width`×`height` RGBA8 texels.

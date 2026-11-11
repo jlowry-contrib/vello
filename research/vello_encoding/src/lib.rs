@@ -46,6 +46,7 @@ mod monoid;
 mod path;
 mod ramp_cache;
 mod resolve;
+mod vibrant;
 
 pub use binning::BinHeader;
 pub use clip::{Clip, ClipBbox, ClipBic, ClipElement};
@@ -54,9 +55,9 @@ pub use config::{
     RenderConfig, WorkgroupCounts, WorkgroupSize,
 };
 pub use draw::{
-    DRAW_INFO_FLAGS_FILL_RULE_BIT, DrawBbox, DrawBeginClip, DrawBlurRoundedRect, DrawColor,
-    DrawImage, DrawLinearGradient, DrawMonoid, DrawRadialGradient, DrawSweepGradient, DrawTag,
-    GLASS_UNCLIPPED_BIN,
+    COMPOSE_PLUS_DARKER, DRAW_INFO_FLAGS_FILL_RULE_BIT, DrawBbox, DrawBeginClip,
+    DrawBlurRoundedRect, DrawColor, DrawImage, DrawLinearGradient, DrawMonoid, DrawRadialGradient,
+    DrawSweepGradient, DrawTag, GLASS_UNCLIPPED_BIN,
 };
 pub use encoding::{Encoding, Resources, StreamOffsets};
 pub use glass::{
@@ -73,6 +74,7 @@ pub use path::{
 };
 pub use ramp_cache::Ramps;
 pub use resolve::{Layout, Patch, Resolver, resolve_solid_paths_only};
+pub use vibrant::{MAX_VIBRANT_MATRICES, VIBRANT_MATRIX_WORDS, VibrantMatrices, VibrantMatrix};
 
 #[cfg(feature = "bump_estimate")]
 pub use estimate::BumpEstimator;

@@ -6,84 +6,12 @@
 //! Run with `GLASS_BASELINE_WRITE=1` on the unpatched code to write
 //! `target/glass-baseline/<name>-<aa>.png` (relative to this crate's directory).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use vello::kurbo::{Affine, Circle, Rect};
-use vello::peniko::{Color, Fill, Mix, color::palette};
-use vello::{AaConfig, Scene};
-use vello_research_tests::glass::background;
+use vello::AaConfig;
+use vello::peniko::color::palette;
+use vello_research_tests::glass::{BASELINE_SIZE as SIZE, baseline_path, baseline_scenes};
 use vello_research_tests::{TestParams, get_scene_image, write_png_to_file};
-
-const SIZE: u32 = 512;
-
-fn layer(scene: &mut Scene, alpha: f32, clip: Rect) {
-    scene.push_layer(Fill::NonZero, Mix::Normal, alpha, Affine::IDENTITY, &clip);
-}
-
-fn baseline_scenes() -> [(&'static str, Scene); 4] {
-    let mut plain = Scene::new();
-    background(&mut plain);
-
-    let mut half = Scene::new();
-    background(&mut half);
-    layer(&mut half, 0.5, Rect::new(64.0, 64.0, 448.0, 448.0));
-    half.fill(
-        Fill::NonZero,
-        Affine::IDENTITY,
-        Color::from_rgba8(20, 60, 220, 255),
-        None,
-        &Circle::new((256.0, 256.0), 220.0),
-    );
-    half.pop_layer();
-
-    let mut nested = Scene::new();
-    background(&mut nested);
-    for i in 0..5_u8 {
-        let inset = 24.0 + 32.0 * f64::from(i);
-        layer(
-            &mut nested,
-            0.9,
-            Rect::new(inset, inset, 512.0 - inset, 512.0 - inset),
-        );
-        nested.fill(
-            Fill::NonZero,
-            Affine::IDENTITY,
-            Color::from_rgba8(40 * i, 90, 200 - 30 * i, 160),
-            None,
-            &Rect::new(inset, inset, 256.0, 512.0 - inset),
-        );
-    }
-    for _ in 0..5 {
-        nested.pop_layer();
-    }
-
-    let mut circle = Scene::new();
-    background(&mut circle);
-    circle.push_clip_layer(
-        Fill::NonZero,
-        Affine::IDENTITY,
-        &Circle::new((256.0, 256.0), 180.0),
-    );
-    circle.fill(
-        Fill::NonZero,
-        Affine::translate((40.0, -30.0)),
-        Color::from_rgba8(250, 200, 40, 255),
-        None,
-        &Rect::new(0.0, 0.0, 512.0, 512.0),
-    );
-    circle.pop_layer();
-
-    [
-        ("background", plain),
-        ("half-layer", half),
-        ("nested-layers", nested),
-        ("circle-clip", circle),
-    ]
-}
-
-fn baseline_path(name: &str, aa: &str) -> PathBuf {
-    Path::new("target/glass-baseline").join(format!("{name}-{aa}.png"))
-}
 
 fn read_png(path: &Path) -> Vec<u8> {
     image::open(path)

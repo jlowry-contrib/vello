@@ -82,7 +82,7 @@ const GLASS_STATE_PHASE = 0u;
 const GLASS_STATE_TILES0 = 1u;
 // [2] tiles past capacity: listed past list 0's or stopped past a phase's, which the setups
 // leave out of the dispatches and add here.
-// [3] commands the lite pass ran, counted only under `GLASS_COUNT_LITE_COMMANDS` (a test).
+// [3] commands the lite pass ran, counted only in the `lite_counted` permutations (a test).
 const GLASS_STATE_LITE_COMMANDS = 3u;
 // [4 + j - 1] the stop count of phase j.
 const GLASS_STATE_STOPS = 4u;
@@ -100,9 +100,6 @@ const GLASS_STATE_INDEX: u32 = 8;
 @group(0) @binding(GLASS_STATE_INDEX)
 var<storage, read_write> glass_state: array<atomic<u32>>;
 
-// `config.glass_flags` bit 1 counts the commands the lite pass runs (a test).
-const GLASS_COUNT_LITE_COMMANDS = 2u;
-
 // Appends tile `tile_ix` to list 0, for the start pass.
 fn glass_list_tile(tile_ix: u32) {
     let slot = atomicAdd(&glass_state[GLASS_STATE_TILES0], 1u);
@@ -111,12 +108,12 @@ fn glass_list_tile(tile_ix: u32) {
     }
 }
 
-// Adds a tile's `commands` to the test count, if it is on.
+#ifdef lite_counted
+// Adds a tile's `commands` to the test count.
 fn glass_count_lite_commands(commands: u32) {
-    if (config.glass_flags & GLASS_COUNT_LITE_COMMANDS) != 0u {
-        atomicAdd(&glass_state[GLASS_STATE_LITE_COMMANDS], commands);
-    }
+    atomicAdd(&glass_state[GLASS_STATE_LITE_COMMANDS], commands);
 }
+#endif
 #endif
 
 // Glass bindings, after the MSAA mask LUT when there is one.
@@ -1368,7 +1365,9 @@ fn main(
         return;
     }
     let blend_offset = blend_word;
+#ifdef lite_counted
     var lite_commands = 0u;
+#endif
 #else
 #ifdef glass
     let blend_offset = ptcl[cmd_ix] & ~PTCL_GLASS_TILE;
@@ -1406,7 +1405,7 @@ fn main(
         if tag == CMD_END {
             break;
         }
-#ifdef lite
+#ifdef lite_counted
         lite_commands += 1u;
 #endif
         switch tag {
@@ -1475,7 +1474,9 @@ fn main(
                 // Unreached while coarse flags every tile with a glass command; a tile it missed
                 // still goes to the start pass, after the lite pass ran its earlier commands.
                 if local_id.x == 0u && local_id.y == 0u {
+#ifdef lite_counted
                     glass_count_lite_commands(lite_commands);
+#endif
                     glass_list_tile(tile_ix);
                 }
                 return;
@@ -1795,7 +1796,7 @@ fn main(
             default: {}
         }
     }
-#ifdef lite
+#ifdef lite_counted
     if local_id.x == 0u && local_id.y == 0u {
         glass_count_lite_commands(lite_commands);
     }

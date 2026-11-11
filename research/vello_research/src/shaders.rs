@@ -33,6 +33,15 @@ pub(crate) struct GlassShaders {
     pub(crate) fine_msaa16_resume: Option<ShaderId>,
     pub(crate) glass_resume_setup: ShaderId,
     pub(crate) glass_start_setup: ShaderId,
+    /// Whether the lite permutations count their commands, for tests.
+    #[cfg_attr(
+        not(feature = "wgpu"),
+        expect(
+            dead_code,
+            reason = "only the wgpu renderer rebuilds the glass shaders"
+        )
+    )]
+    pub(crate) lite_counted: bool,
 }
 
 /// Returns the shader table: compiled at build time, or from source with `hot_reload`.
@@ -80,11 +89,14 @@ const FINE_RESOURCES: [BindType; 9] = [
 ];
 
 /// Builds the glass fine permutations for the AA modes in `aa_support`, and the dispatch setups.
+///
+/// With `lite_counted`, the lite permutations count their commands in `glass_state`, for tests.
 #[cfg(feature = "wgpu")]
 pub(crate) fn glass_shaders(
     device: &Device,
     engine: &mut WgpuEngine,
     aa_support: AaSupport,
+    lite_counted: bool,
 ) -> Result<GlassShaders, Error> {
     use crate::wgpu_engine::CpuShaderType;
     use BindType::*;
@@ -118,7 +130,11 @@ pub(crate) fn glass_shaders(
         [
             add(
                 "vello.fine_area_lite",
-                shader_source!(shaders, fine_area_lite),
+                if lite_counted {
+                    shader_source!(shaders, fine_area_lite_counted)
+                } else {
+                    shader_source!(shaders, fine_area_lite)
+                },
                 &area_lite,
             ),
             add(
@@ -140,7 +156,11 @@ pub(crate) fn glass_shaders(
         [
             add(
                 "vello.fine_msaa8_lite",
-                shader_source!(shaders, fine_msaa8_lite),
+                if lite_counted {
+                    shader_source!(shaders, fine_msaa8_lite_counted)
+                } else {
+                    shader_source!(shaders, fine_msaa8_lite)
+                },
                 &msaa_lite,
             ),
             add(
@@ -162,7 +182,11 @@ pub(crate) fn glass_shaders(
         [
             add(
                 "vello.fine_msaa16_lite",
-                shader_source!(shaders, fine_msaa16_lite),
+                if lite_counted {
+                    shader_source!(shaders, fine_msaa16_lite_counted)
+                } else {
+                    shader_source!(shaders, fine_msaa16_lite)
+                },
                 &msaa_lite,
             ),
             add(
@@ -203,6 +227,7 @@ pub(crate) fn glass_shaders(
         fine_msaa16_resume,
         glass_resume_setup,
         glass_start_setup,
+        lite_counted,
     })
 }
 

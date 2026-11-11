@@ -11,6 +11,9 @@ fine
 + fine_area_lite: lite
 + fine_msaa8_lite: msaa msaa8 lite
 + fine_msaa16_lite: msaa msaa16 lite
++ fine_area_lite_counted: lite lite_counted
++ fine_msaa8_lite_counted: msaa msaa8 lite lite_counted
++ fine_msaa16_lite_counted: msaa msaa16 lite lite_counted
 + fine_area_start: glass start
 + fine_msaa8_start: msaa msaa8 glass start
 + fine_msaa16_start: msaa msaa16 glass start

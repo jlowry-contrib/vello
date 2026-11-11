@@ -653,11 +653,15 @@ impl Renderer {
             log::warn!("glass.cpu.unsupported markers={}", plan.placements.len());
             return self.render_to_texture(device, queue, scene, texture, params);
         }
+        let counted = self.glass_lite_commands_counted;
         let glass_shaders = match self.glass_shaders.take() {
-            Some(glass_shaders) => glass_shaders,
-            None => {
-                shaders::glass_shaders(device, &mut self.engine, self.options.antialiasing_support)?
-            }
+            Some(glass_shaders) if glass_shaders.lite_counted == counted => glass_shaders,
+            _ => shaders::glass_shaders(
+                device,
+                &mut self.engine,
+                self.options.antialiasing_support,
+                counted,
+            )?,
         };
         let glass_shaders = self.glass_shaders.insert(glass_shaders);
         let glass_format = match self.glass_atlas_format {
@@ -691,9 +695,8 @@ impl Renderer {
             rows: &plan.rows,
             phases: plan.phases,
             resume_color: limits.resume_color,
-            // Bit 0 skips every stop; bit 1 counts the lite pass's commands.
-            flags: u32::from(self.glass_stops_disabled)
-                | u32::from(self.glass_lite_commands_counted) << 1,
+            // Bit 0 skips every stop.
+            flags: u32::from(self.glass_stops_disabled),
             list_capacity: plan.list_capacity,
             capacities: plan.capacities,
             record_words: plan.record_words,
@@ -828,6 +831,8 @@ impl Renderer {
 
     /// Makes glass frames count the commands the lite fine pass runs, in `glass_state`
     /// word 3, for the split tests.
+    ///
+    /// The count runs in separate lite permutations, built on the next glass frame.
     #[doc(hidden)]
     pub fn set_glass_lite_commands_counted(&mut self, counted: bool) {
         self.glass_lite_commands_counted = counted;

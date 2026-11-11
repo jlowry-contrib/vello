@@ -44,7 +44,7 @@ struct Config {
     glass_markers: u32,
     glass_phases: u32,
     glass_resume_color: u32,
-    // Test controls: bit 0 skips every glass stop, bit 1 counts the lite pass's commands.
+    // Test controls: bit 0 skips every glass stop.
     glass_flags: u32,
     // Capacity of list 0, the tiles with glass commands, in tiles.
     glass_capacity_0: u32,

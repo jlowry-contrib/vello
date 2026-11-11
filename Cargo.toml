@@ -12,6 +12,7 @@ members = [
     "tools/run_wasm",
     "research/examples/scenes",
     "research/examples/simple",
+    "research/examples/stock_frame_time",
     "research/examples/with_winit",
 
     "vello_cpu",

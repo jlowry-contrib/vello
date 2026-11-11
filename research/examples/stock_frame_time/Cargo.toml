@@ -1,0 +1,16 @@
+[package]
+name = "stock_frame_time"
+description = "Times Vello's stock render path on a fixed scene, for comparing revisions."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+vello = { workspace = true }
+
+anyhow = { workspace = true }
+pollster = { workspace = true }

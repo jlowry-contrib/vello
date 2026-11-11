@@ -25,13 +25,18 @@ const DRAWTAG_FILL_IMAGE = 0x28Cu;
 const DRAWTAG_BLURRED_ROUNDED_RECT = 0x2d4u;
 const DRAWTAG_BEGIN_CLIP = 0x49u;
 const DRAWTAG_END_CLIP = 0x21u;
-// Glass marker: scene words are the marker index and the composite's tile min and max.
-const DRAWTAG_GLASS = 0x4Cu;
+// Glass marker: scene words are the marker index and the composite's tile min and max; info
+// words are the flags and the clip box's tile min and max, which binning writes.
+const DRAWTAG_GLASS = 0xCCu;
 
 /// The first word of each draw info stream entry contains the flags. This is not a part of the
 /// draw object stream but get used after the draw objects have been reduced on the GPU.
 /// 0 represents a non-zero fill. 1 represents an even-odd fill.
 const DRAW_INFO_FLAGS_FILL_RULE_BIT = 1u;
+
+// Set in a `GLASS` draw's info flags: binning bins it over its own bounding box and writes its
+// clip box into the next two info words. Mirrors `GLASS_UNCLIPPED_BIN` in `vello_encoding`.
+const GLASS_UNCLIPPED_BIN = 0x80000000u;
 
 fn draw_monoid_identity() -> DrawMonoid {
     return DrawMonoid();

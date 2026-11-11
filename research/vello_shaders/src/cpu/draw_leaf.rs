@@ -1,7 +1,9 @@
 // Copyright 2023 the Vello Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT OR Unlicense
 
-use vello_encoding::{Clip, ConfigUniform, DrawMonoid, DrawTag, Monoid, PathBbox};
+use vello_encoding::{
+    Clip, ConfigUniform, DrawMonoid, DrawTag, GLASS_UNCLIPPED_BIN, Monoid, PathBbox,
+};
 
 use super::{
     CpuBinding, RAD_GRAD_KIND_CIRCULAR, RAD_GRAD_KIND_CONE, RAD_GRAD_KIND_FOCAL_ON_CIRCLE,
@@ -192,8 +194,11 @@ fn draw_leaf_main(
                         info[di + 9] = scene[dd as usize + 3];
                         info[di + 10] = scene[dd as usize + 4];
                     }
-                    DrawTag::BEGIN_CLIP | DrawTag::GLASS => {
+                    DrawTag::BEGIN_CLIP => {
                         info[di] = draw_flags;
+                    }
+                    DrawTag::GLASS => {
+                        info[di] = draw_flags | GLASS_UNCLIPPED_BIN;
                     }
                     _ => todo!("unhandled draw tag {:x}", tag_word.0),
                 }

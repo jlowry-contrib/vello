@@ -56,6 +56,7 @@ pub use config::{
 pub use draw::{
     DRAW_INFO_FLAGS_FILL_RULE_BIT, DrawBbox, DrawBeginClip, DrawBlurRoundedRect, DrawColor,
     DrawImage, DrawLinearGradient, DrawMonoid, DrawRadialGradient, DrawSweepGradient, DrawTag,
+    GLASS_UNCLIPPED_BIN,
 };
 pub use encoding::{Encoding, Resources, StreamOffsets};
 pub use glass::{

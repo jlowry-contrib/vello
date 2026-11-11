@@ -1,7 +1,9 @@
 // Copyright 2023 the Vello Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT OR Unlicense
 
-use vello_encoding::{BinHeader, BumpAllocators, ConfigUniform, DrawMonoid, PathBbox};
+use vello_encoding::{
+    BinHeader, BumpAllocators, ConfigUniform, DrawMonoid, GLASS_UNCLIPPED_BIN, PathBbox,
+};
 
 use super::CpuBinding;
 
@@ -59,7 +61,23 @@ fn binning_main(
                     path_bbox.x1 as f32,
                     path_bbox.y1 as f32,
                 ];
-                let bbox = bbox_intersect(clip_bbox, pb);
+                let mut bbox = bbox_intersect(clip_bbox, pb);
+                // A glass draw is binned over its own box, and coarse gets the clip box in
+                // tiles. An END_CLIP's info offset is its BEGIN_CLIP's (clip_leaf), and a draw
+                // past the info stream has no info.
+                let di = draw_monoid.info_offset as usize;
+                if di < config.layout.bin_data_start as usize
+                    && bin_data[di] & GLASS_UNCLIPPED_BIN != 0
+                {
+                    let (w, h) = (config.width_in_tiles as f32, config.height_in_tiles as f32);
+                    let clip_x0 = (clip_bbox[0] / TILE_WIDTH as f32).floor().clamp(0.0, w) as u32;
+                    let clip_y0 = (clip_bbox[1] / TILE_HEIGHT as f32).floor().clamp(0.0, h) as u32;
+                    let clip_x1 = (clip_bbox[2] / TILE_WIDTH as f32).ceil().clamp(0.0, w) as u32;
+                    let clip_y1 = (clip_bbox[3] / TILE_HEIGHT as f32).ceil().clamp(0.0, h) as u32;
+                    bin_data[di + 1] = clip_x0 | (clip_y0 << 16);
+                    bin_data[di + 2] = clip_x1 | (clip_y1 << 16);
+                    bbox = pb;
+                }
                 intersected_bbox[element_ix] = bbox;
                 if bbox[0] < bbox[2] && bbox[1] < bbox[3] {
                     x0 = (bbox[0] * SX).floor() as i32;

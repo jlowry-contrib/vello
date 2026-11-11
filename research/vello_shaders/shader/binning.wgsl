@@ -96,7 +96,21 @@ fn main(
 
         let path_bbox = path_bbox_buf[draw_monoid.path_ix];
         let pb = vec4<f32>(vec4(path_bbox.x0, path_bbox.y0, path_bbox.x1, path_bbox.y1));
-        let bbox = bbox_intersect(clip_bbox, pb);
+        var bbox = bbox_intersect(clip_bbox, pb);
+
+        // A glass draw is binned over its own box, so its backdrop reaches past its clips, and
+        // coarse gets the clip box in tiles. An END_CLIP's info offset is its BEGIN_CLIP's
+        // (clip_leaf), and a draw past the info stream has no info.
+        let di = draw_monoid.info_offset;
+        if di < config.bin_data_start && (bin_data[di] & GLASS_UNCLIPPED_BIN) != 0u {
+            let size = vec2(f32(config.width_in_tiles), f32(config.height_in_tiles));
+            let tile = vec2(f32(TILE_WIDTH), f32(TILE_HEIGHT));
+            let clip_min = vec2<u32>(clamp(floor(clip_bbox.xy / tile), vec2(0.0), size));
+            let clip_max = vec2<u32>(clamp(ceil(clip_bbox.zw / tile), vec2(0.0), size));
+            bin_data[di + 1u] = clip_min.x | (clip_min.y << 16u);
+            bin_data[di + 2u] = clip_max.x | (clip_max.y << 16u);
+            bbox = pb;
+        }
 
         intersected_bbox[element_ix] = bbox;
 

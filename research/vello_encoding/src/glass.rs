@@ -459,8 +459,8 @@ mod tests {
     }
 
     #[test]
-    fn glass_tag_carries_three_scene_words_and_one_info_word() {
-        assert_eq!(DrawTag::GLASS.info_size(), 1);
+    fn glass_tag_carries_three_scene_words_and_three_info_words() {
+        assert_eq!(DrawTag::GLASS.info_size(), 3);
         assert_eq!((DrawTag::GLASS.0 >> 2) & 0x7, 3);
         assert_eq!(DrawTag::GLASS.0 & 1, 0);
     }

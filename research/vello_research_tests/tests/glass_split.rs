@@ -66,22 +66,6 @@ fn layer(scene: &mut Scene, alpha: f32, clip: &impl Shape) {
     scene.push_layer(Fill::NonZero, Mix::Normal, alpha, Affine::IDENTITY, clip);
 }
 
-/// Snaps a clip shape's bounds outward to tiles, as binning clips the glass draw to them.
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "the test shapes' bounds are small pixel coordinates"
-)]
-fn clip_tiles(shape: &impl Shape) -> IRect {
-    let b = shape.bounding_box();
-    rect(
-        b.x0.floor() as i32,
-        b.y0.floor() as i32,
-        b.x1.ceil() as i32,
-        b.y1.ceil() as i32,
-    )
-    .snap_out(16)
-}
-
 fn intersect(a: IRect, b: IRect) -> IRect {
     rect(
         a.x0.max(b.x0),
@@ -155,21 +139,15 @@ fn prefix(width: u32, aa: AaConfig, build: impl Fn(&mut Scene, Part)) -> Vec<u8>
     render_scene(width, width, aa, &scene)
 }
 
-/// Checks every captured slot against the prefix render, inside `valid`.
-fn check_snapshot(width: u32, aa: AaConfig, valid: IRect, build: impl Fn(&mut Scene, Part) + Copy) {
+/// Checks every captured slot against the prefix render, including beyond the open clips.
+fn check_snapshot(width: u32, aa: AaConfig, build: impl Fn(&mut Scene, Part) + Copy) {
     let capture = split(width, aa, build);
     assert_eq!(capture.phases, [1], "one phase");
     assert_eq!(capture.placements.len(), 1, "one marker");
     let atlas = capture.backdrop();
     let prefix = prefix(width, aa, build);
     let placement = &capture.placements[0];
-    assert_slot(
-        &atlas,
-        placement,
-        &prefix,
-        width,
-        intersect(placement.region, valid),
-    );
+    assert_slot(&atlas, placement, &prefix, width, placement.region);
 }
 
 const REGION: IRect = IRect {
@@ -183,12 +161,6 @@ const COMPOSITE: IRect = IRect {
     y0: 128,
     x1: 288,
     y1: 192,
-};
-const EVERYWHERE: IRect = IRect {
-    x0: i32::MIN,
-    y0: i32::MIN,
-    x1: i32::MAX,
-    y1: i32::MAX,
 };
 
 fn after_marker(scene: &mut Scene) {
@@ -239,7 +211,7 @@ fn glass_frame_calls_the_hook_once_per_phase() {
 #[cfg_attr(skip_gpu_tests, ignore)]
 fn snapshot_matches_the_prefix_render() {
     for aa in [AaConfig::Area, AaConfig::Msaa16] {
-        check_snapshot(512, aa, EVERYWHERE, plain);
+        check_snapshot(512, aa, plain);
     }
 }
 
@@ -303,7 +275,7 @@ fn snapshot_inside_a_layer_matches_the_prefix_with_layers_closed() {
         after_marker(scene);
         scene.pop_layer();
     };
-    check_snapshot(512, AaConfig::Area, clip_tiles(&clip), build);
+    check_snapshot(512, AaConfig::Area, build);
 }
 
 #[test]
@@ -331,8 +303,7 @@ fn snapshot_inside_a_circle_clip_and_an_opacity_layer_matches() {
         scene.pop_layer();
         scene.pop_layer();
     };
-    let valid = intersect(clip_tiles(&outer), clip_tiles(&circle));
-    check_snapshot(512, AaConfig::Area, valid, build);
+    check_snapshot(512, AaConfig::Area, build);
 }
 
 #[test]
@@ -359,7 +330,101 @@ fn snapshot_in_a_clip_zero_tile_matches_the_prefix() {
         after_marker(scene);
         scene.pop_layer();
     };
-    check_snapshot(512, AaConfig::Area, clip_tiles(&circle), build);
+    check_snapshot(512, AaConfig::Area, build);
+}
+
+/// A 64 px tall clip, as a scroll view's, over a background.
+const SCROLL_CLIP: Rect = Rect::new(0.0, 128.0, 512.0, 192.0);
+
+/// Builds a clip whose hidden content is solid blue, with a marker inside it.
+fn clipped_marker(clip: Rect, region: IRect, composite: IRect) -> impl Fn(&mut Scene, Part) + Copy {
+    move |scene: &mut Scene, part: Part| {
+        background(scene);
+        scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &clip);
+        fill(scene, [0, 0, 255, 255], &Rect::new(0.0, 0.0, 512.0, 512.0));
+        if part == Part::Prefix {
+            close(scene, 1);
+            return;
+        }
+        if part == Part::Marked {
+            marker(scene, region, composite);
+        }
+        scene.pop_layer();
+    }
+}
+
+/// Renders `build` unmarked and split, with glass written over marker 0's composite.
+fn write_glass_pair(build: impl Fn(&mut Scene, Part)) -> (Vec<u8>, Vec<u8>, CaptureBackdrop) {
+    let mut passes = WriteGlass::default();
+    let (unmarked, split) = outputs(
+        AaConfig::Area,
+        GlassResumeFormat::F32,
+        |_| {},
+        |scene, marked| build(scene, Part::of(marked)),
+        &mut passes,
+    );
+    (unmarked, split, passes.capture)
+}
+
+#[test]
+#[cfg_attr(skip_gpu_tests, ignore)]
+fn clipped_glass_snapshots_beyond_the_clip_box() {
+    // The region extends 32 px past the clip on both sides; there the backdrop is what lies
+    // behind the clip, not the clip's hidden blue.
+    let build = clipped_marker(
+        SCROLL_CLIP,
+        rect(96, 96, 320, 224),
+        rect(128, 128, 288, 192),
+    );
+    for aa in [AaConfig::Area, AaConfig::Msaa16] {
+        check_snapshot(512, aa, build);
+    }
+}
+
+#[test]
+#[cfg_attr(skip_gpu_tests, ignore)]
+fn clipped_glass_composites_only_inside_the_clip() {
+    // The composite crosses the clip's top edge by 16 px and its bottom edge by 32 px.
+    let build = clipped_marker(
+        SCROLL_CLIP,
+        rect(96, 96, 320, 256),
+        rect(128, 112, 288, 224),
+    );
+    let (unmarked, split, capture) = write_glass_pair(build);
+    assert_eq!(capture.phases, [1]);
+    let (mut outside, mut inside) = (0_u8, 0_u8);
+    for y in 0..512_u32 {
+        for x in 0..512_u32 {
+            let i = ((y * 512 + x) * 4) as usize;
+            let delta = max_delta(&unmarked[i..i + 4], &split[i..i + 4]);
+            if (128..192).contains(&y) {
+                inside = inside.max(delta);
+            } else {
+                outside = outside.max(delta);
+            }
+        }
+    }
+    assert_eq!(outside, 0, "glass composited outside the clip");
+    assert!(inside > 0, "no glass composited inside the clip");
+}
+
+#[test]
+#[cfg_attr(skip_gpu_tests, ignore)]
+fn glass_clipped_away_entirely_composites_nothing() {
+    let build = clipped_marker(Rect::new(0.0, 320.0, 512.0, 384.0), REGION, COMPOSITE);
+    let (unmarked, split, capture) = write_glass_pair(build);
+    assert_eq!(capture.phases, [1]);
+    assert_eq!(max_delta(&unmarked, &split), 0, "glass composited");
+    // The snapshot still holds what lies behind the clip.
+    let prefix = prefix(512, AaConfig::Area, build);
+    let placement = &capture.placements[0];
+    assert_slot(
+        &capture.backdrop(),
+        placement,
+        &prefix,
+        512,
+        placement.region,
+    );
 }
 
 #[test]
@@ -393,7 +458,7 @@ fn snapshot_with_five_open_layers_reads_the_spill_buffer() {
             scene.pop_layer();
         }
     };
-    check_snapshot(512, AaConfig::Area, EVERYWHERE, build);
+    check_snapshot(512, AaConfig::Area, build);
 }
 
 /// Collects log messages, so a test can check a warning was emitted.

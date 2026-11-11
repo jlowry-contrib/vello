@@ -136,7 +136,7 @@ fn main(
                     info[di] = draw_flags;
                 }
                 case DRAWTAG_GLASS: {
-                    info[di] = draw_flags;
+                    info[di] = draw_flags | GLASS_UNCLIPPED_BIN;
                 }
                 case DRAWTAG_FILL_LIN_GRADIENT: {
                     info[di] = draw_flags;

@@ -190,10 +190,18 @@ fn write_glass_cmd(cmd: u32, marker: u32) {
     cmd_offset += 2u;
 }
 
-// Writes a glass marker's commands for tile (x, y): the flattened backdrop of the open
-// layers, the snapshot and, unless the tile is clipped away, the stop and composite. A
-// marker the frame leaves out gets none.
-fn write_glass(dd: u32, x: u32, y: u32, depth: u32, clip_zero: bool) {
+// Whether tile (x, y) lies in the tile box packed as two `u16` pairs, min and max.
+fn in_tile_box(x: u32, y: u32, box_min: u32, box_max: u32) -> bool {
+    return x >= (box_min & 0xffffu) && x < (box_max & 0xffffu) &&
+        y >= (box_min >> 16u) && y < (box_max >> 16u);
+}
+
+// Writes a glass marker's commands for tile (x, y): the flattened backdrop of the layers open
+// in this tile, the snapshot and, inside both the composite and the clip box and unless the
+// tile is clipped away, the stop and composite. Binning bins the marker past its clip box,
+// where the enclosing BEGIN_CLIP isn't binned, so `clip_zero` is false there and only the
+// clip box keeps the composite inside the clip. A marker the frame leaves out gets none.
+fn write_glass(dd: u32, di: u32, x: u32, y: u32, depth: u32, clip_zero: bool) {
     // `Scene::append` can nest a marker deeper than `push_glass` checked; the frame leaves
     // such markers out too, and the depth test is a backstop.
     if config.glass_phases == 0u || depth > MAX_GLASS_LAYERS || (scene[dd] & GLASS_MARKER_SKIP) != 0u {
@@ -216,11 +224,9 @@ fn write_glass(dd: u32, x: u32, y: u32, depth: u32, clip_zero: bool) {
     }
     let marker = scene[dd];
     write_glass_cmd(CMD_GLASS_SNAPSHOT, marker);
-    let composite_min = scene[dd + 1u];
-    let composite_max = scene[dd + 2u];
-    let in_composite = x >= (composite_min & 0xffffu) && x < (composite_max & 0xffffu) &&
-        y >= (composite_min >> 16u) && y < (composite_max >> 16u);
-    if !clip_zero && in_composite {
+    let in_composite = in_tile_box(x, y, scene[dd + 1u], scene[dd + 2u]);
+    let in_clip = in_tile_box(x, y, info_bin_data[di + 1u], info_bin_data[di + 2u]);
+    if !clip_zero && in_composite && in_clip {
         write_glass_cmd(CMD_GLASS_STOP, marker);
         write_glass_cmd(CMD_GLASS_COMPOSITE, marker);
     }
@@ -523,7 +529,7 @@ fn main(
                         render_blend_depth -= 1u;
                     }
                     case DRAWTAG_GLASS: {
-                        write_glass(dd, bin_tile_x + tile_x, bin_tile_y + tile_y, render_blend_depth, false);
+                        write_glass(dd, di, bin_tile_x + tile_x, bin_tile_y + tile_y, render_blend_depth, false);
                     }
                     default: {}
                 }
@@ -540,7 +546,7 @@ fn main(
                         clip_depth -= 1u;
                     }
                     case DRAWTAG_GLASS: {
-                        write_glass(dd, bin_tile_x + tile_x, bin_tile_y + tile_y, render_blend_depth, true);
+                        write_glass(dd, di, bin_tile_x + tile_x, bin_tile_y + tile_y, render_blend_depth, true);
                     }
                     default: {}
                 }

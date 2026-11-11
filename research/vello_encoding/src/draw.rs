@@ -43,7 +43,7 @@ impl DrawTag {
     pub const END_CLIP: Self = Self(0x21);
 
     /// Glass marker.
-    pub const GLASS: Self = Self(0x4C); // info: 1, scene: 3 (index, composite tile min, max)
+    pub const GLASS: Self = Self(0xCC); // info: 3 (flags, clip tiles), scene: 3
 }
 
 impl DrawTag {
@@ -59,6 +59,11 @@ impl DrawTag {
 /// objects get reduced on the GPU. `0` represents a non-zero fill.
 /// `1` represents an even-odd fill.
 pub const DRAW_INFO_FLAGS_FILL_RULE_BIT: u32 = 1;
+
+/// Set in a `GLASS` draw object's info flags, so binning bins it over its own bounding box
+/// rather than the box intersected with its clips. Binning then writes the clip box, in
+/// tiles, into the draw object's second and third info words for coarse.
+pub const GLASS_UNCLIPPED_BIN: u32 = 1 << 31;
 
 /// Draw object bounding box.
 #[derive(Copy, Clone, Pod, Zeroable, Debug, Default)]

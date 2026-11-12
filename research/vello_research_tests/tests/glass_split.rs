@@ -218,8 +218,9 @@ fn snapshot_matches_the_prefix_render() {
 #[test]
 #[cfg_attr(skip_gpu_tests, ignore)]
 fn neighbouring_slots_stay_separate_at_an_unaligned_edge() {
-    // Both regions snap to 112 px tall slots, so they share a shelf; the first ends past the
-    // 500 px edge, so its last 12 slot columns and rows are never written.
+    // Both regions snap to 112 px and round up to 128 px tall slots, so they share a shelf;
+    // the first ends past the 500 px edge, so its last 28 slot columns and rows are never
+    // written.
     let right = rect(404, 404, 500, 500);
     let left = rect(0, 404, 96, 500);
     let build = |scene: &mut Scene, part: Part| {
@@ -245,7 +246,7 @@ fn neighbouring_slots_stay_separate_at_an_unaligned_edge() {
     };
     assert_eq!(a.region, rect(400, 400, 500, 500));
     assert_eq!(b.region, rect(0, 400, 96, 500));
-    assert_eq!((a.backdrop_origin, b.backdrop_origin), ((0, 0), (112, 0)));
+    assert_eq!((a.backdrop_origin, b.backdrop_origin), ((0, 0), (128, 0)));
     let atlas = capture.backdrop();
     let prefix = prefix(500, AaConfig::Area, build);
     assert_slot(&atlas, &a, &prefix, 500, a.region);

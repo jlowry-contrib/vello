@@ -29,7 +29,7 @@ pub struct MarkerPlacement {
     pub region: IRect,
     /// Pixels the glass writes, tile-snapped and clamped to the target.
     pub composite: IRect,
-    /// Top-left of the marker's slot in the backdrop atlas.
+    /// Top-left of the marker's slot in the backdrop atlas, on a multiple of 32 px.
     pub backdrop_origin: (u32, u32),
     /// Top-left of the marker's slot in the glass atlas.
     pub glass_origin: (u32, u32),
@@ -217,6 +217,11 @@ pub(crate) fn forced_plan(markers: usize) -> GlassPlan {
 #[cfg(feature = "wgpu")]
 const TILE: i32 = 16;
 
+/// Alignment of backdrop slots in pixels: a glass backend's level 5 pyramid texel then
+/// covers whole 32 px blocks of the atlas, never straddling two slots.
+#[cfg(feature = "wgpu")]
+const BACKDROP_ALIGN: u32 = 32;
+
 /// Narrowest atlas the shelf packer makes; one 512 px shelf holds most frames' slots.
 #[cfg(feature = "wgpu")]
 const MIN_ATLAS_WIDTH: u32 = 512;
@@ -242,6 +247,15 @@ pub(crate) fn plan(
     let size = |r: IRect| {
         let r = r.snap_out(TILE);
         ((r.x1 - r.x0) as u32, (r.y1 - r.y0) as u32)
+    };
+    // Backdrop slots round up to whole `BACKDROP_ALIGN` blocks, so every backdrop origin
+    // lands on a multiple of it.
+    let backdrop_size = |r: IRect| {
+        let (w, h) = size(r);
+        (
+            w.next_multiple_of(BACKDROP_ALIGN),
+            h.next_multiple_of(BACKDROP_ALIGN),
+        )
     };
     let tile_count = |r: IRect| {
         let [x0, y0, x1, y1] = tiles(r);
@@ -296,7 +310,7 @@ pub(crate) fn plan(
         let state_size = pooled_size(glass_state_size(list, caps, words));
         let fits_size = state_size <= limits.state_size;
         let fits_dispatch = list <= limits.workgroups && caps[p] <= limits.workgroups;
-        backdrop_sizes.push(size(clamped[j].region));
+        backdrop_sizes.push(backdrop_size(clamped[j].region));
         glass_sizes.push(size(clamped[j].composite));
         let fits_atlases = fits_atlas(&backdrop_sizes) && fits_atlas(&glass_sizes);
         let fits = fits_size && fits_dispatch && fits_atlases;
@@ -722,6 +736,27 @@ mod tests {
         for _ in 0..200 {
             assert_eq!(sizer.size((1024, 257)), (1024, 1024));
         }
+    }
+
+    #[test]
+    fn backdrop_slots_align_to_32_px() {
+        let m = markers(&[
+            (0, r(0, 0, 48, 16), r(0, 0, 16, 16), 0),
+            (1, r(64, 0, 144, 80), r(80, 16, 128, 64), 0),
+            (2, r(160, 0, 176, 112), r(160, 0, 176, 16), 0),
+            (3, r(192, 0, 400, 48), r(208, 16, 240, 32), 0),
+            (4, r(0, 128, 16, 144), r(0, 128, 16, 144), 0),
+        ]);
+        let plan = plan(&m, 512, 512);
+        assert_eq!(plan.placements.len(), 5);
+        for p in &plan.placements {
+            let (x, y) = p.backdrop_origin;
+            assert_eq!((x % 32, y % 32), (0, 0), "marker {}", p.id);
+        }
+        assert_eq!(
+            (plan.backdrop_size.0 % 32, plan.backdrop_size.1 % 32),
+            (0, 0)
+        );
     }
 
     #[test]

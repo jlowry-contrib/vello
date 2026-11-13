@@ -4,8 +4,8 @@
 //! Glass markers: points in paint order where glass reads its backdrop.
 
 pub use vello_encoding::{
-    GlassMarker, GlassMarkers, GlassSkip, IRect, MAX_GLASS_LAYERS, MAX_GLASS_PHASES, assign_phases,
-    pack_shelves,
+    BackdropFill, FoldedPhases, GlassMarker, GlassMarkers, GlassSkip, IRect, MAX_GLASS_LAYERS,
+    MAX_GLASS_PHASES, assign_phases, backdrop_fills, fold_phases_fitting, pack_shelves,
 };
 
 #[cfg(feature = "wgpu")]

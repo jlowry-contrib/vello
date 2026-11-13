@@ -61,8 +61,9 @@ pub use draw::{
 };
 pub use encoding::{Encoding, Resources, StreamOffsets};
 pub use glass::{
-    GLASS_MARKER_SKIP, GlassMarker, GlassMarkers, GlassSkip, IRect, MAX_GLASS_LAYERS,
-    MAX_GLASS_PHASES, assign_phases, assign_phases_fitting, pack_shelves,
+    BackdropFill, FoldedPhases, GLASS_MARKER_SKIP, GlassMarker, GlassMarkers, GlassSkip, IRect,
+    MAX_GLASS_LAYERS, MAX_GLASS_PHASES, assign_phases, assign_phases_fitting, backdrop_fills,
+    fold_phases_fitting, pack_shelves,
 };
 pub use glyph::{FontEmbolden, Glyph, GlyphRun};
 pub use mask::{make_mask_lut, make_mask_lut_16};

@@ -50,6 +50,16 @@ impl IRect {
             && other.y0 < self.y1
     }
 
+    /// Returns the pixels the two rectangles share, which may be empty.
+    pub fn intersect(&self, other: &Self) -> Self {
+        Self {
+            x0: self.x0.max(other.x0),
+            y0: self.y0.max(other.y0),
+            x1: self.x1.min(other.x1),
+            y1: self.y1.min(other.y1),
+        }
+    }
+
     /// Returns `true` if `other` lies inside this rectangle.
     pub(crate) fn contains(self, other: Self) -> bool {
         self.x0 <= other.x0 && self.y0 <= other.y0 && other.x1 <= self.x1 && other.y1 <= self.y1
@@ -258,10 +268,47 @@ pub fn assign_phases(markers: &[GlassMarker]) -> (Vec<u32>, usize) {
 /// still tried. Returns the phases and how many markers the cap left out.
 pub fn assign_phases_fitting(
     markers: &[GlassMarker],
+    fits: impl FnMut(usize, u32) -> bool,
+) -> (Vec<u32>, usize) {
+    phases_fitting(markers, false, fits)
+}
+
+/// Glass phases with markers past the cap folded into the last phase.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FoldedPhases {
+    /// Each marker's phase, in paint order; 0 for a marker `fits` rejected.
+    pub phases: Vec<u32>,
+    /// How many kept markers were folded into [`MAX_GLASS_PHASES`].
+    pub folded: usize,
+}
+
+/// Assigns phases as [`assign_phases_fitting`] does, folding markers past the cap into the
+/// last phase instead of leaving them out.
+///
+/// A marker that would need a phase past [`MAX_GLASS_PHASES`] takes `MAX_GLASS_PHASES`, and
+/// `fits(i, MAX_GLASS_PHASES)` decides it as for any marker. A kept folded marker counts in
+/// [`FoldedPhases::folded`] and raises later markers' phases like any kept marker, so their
+/// phases fold too. A folded marker's region may meet an earlier same-phase composite: its
+/// backdrop there needs [`backdrop_fills`].
+pub fn fold_phases_fitting(
+    markers: &[GlassMarker],
+    fits: impl FnMut(usize, u32) -> bool,
+) -> FoldedPhases {
+    let (phases, folded) = phases_fitting(markers, true, fits);
+    FoldedPhases { phases, folded }
+}
+
+/// Assigns phases in paint order, folding or leaving out markers past the cap.
+///
+/// Returns the phases and how many markers passed the cap: those left out, or the kept
+/// ones folded.
+fn phases_fitting(
+    markers: &[GlassMarker],
+    fold: bool,
     mut fits: impl FnMut(usize, u32) -> bool,
 ) -> (Vec<u32>, usize) {
     let mut phases: Vec<u32> = Vec::with_capacity(markers.len());
-    let mut capped = 0;
+    let mut past_cap = 0;
     for (i, marker) in markers.iter().enumerate() {
         let below = markers[..i]
             .iter()
@@ -271,16 +318,63 @@ pub fn assign_phases_fitting(
             .max()
             .unwrap_or(0);
         let phase = below + 1;
-        if phase > MAX_GLASS_PHASES {
-            capped += 1;
+        if phase > MAX_GLASS_PHASES && !fold {
+            past_cap += 1;
             phases.push(0);
-        } else if fits(i, phase) {
-            phases.push(phase);
+        } else if fits(i, phase.min(MAX_GLASS_PHASES)) {
+            if phase > MAX_GLASS_PHASES {
+                past_cap += 1;
+            }
+            phases.push(phase.min(MAX_GLASS_PHASES));
         } else {
             phases.push(0);
         }
     }
-    (phases, capped)
+    (phases, past_cap)
+}
+
+/// A backdrop copy a folded glass marker needs before its phase's glass passes record.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct BackdropFill {
+    /// The phase both markers share.
+    pub phase: u32,
+    /// Index of the earlier marker whose backdrop slot is read.
+    pub from: usize,
+    /// Index of the later marker whose backdrop slot is written.
+    pub to: usize,
+    /// Pixels to copy: `from`'s composite within `to`'s region.
+    ///
+    /// Tile-aligned, except where a marker was clamped at the target's right or bottom edge.
+    pub rect: IRect,
+}
+
+/// Lists the backdrop copies that markers sharing a phase need, in paint order of `to`.
+///
+/// On a tile of marker `to`'s region that also lies in an earlier same-phase marker `from`'s
+/// composite, fine stops at `from` and resumes only in that phase's fine pass, after its glass
+/// passes ran, so `to`'s backdrop is never snapshot there. Same-phase composites never
+/// overlap and a composite lies inside its region, so `from`'s slot holds the backdrop
+/// `from` saw on those tiles, which the renderer copies into `to`'s slot. Only markers
+/// folded by [`fold_phases_fitting`] can meet a same-phase composite, so other frames get
+/// no fills. Markers with phase 0 are skipped.
+pub fn backdrop_fills(markers: &[GlassMarker], phases: &[u32]) -> Vec<BackdropFill> {
+    let mut fills = Vec::new();
+    for (to, (marker, &phase)) in markers.iter().zip(phases).enumerate() {
+        if phase == 0 {
+            continue;
+        }
+        for (from, earlier) in markers[..to].iter().enumerate() {
+            if phases[from] == phase && earlier.composite.intersects(&marker.region) {
+                fills.push(BackdropFill {
+                    phase,
+                    from,
+                    to,
+                    rect: earlier.composite.intersect(&marker.region),
+                });
+            }
+        }
+    }
+    fills
 }
 
 /// Packs `(width, height)` slots onto shelves, returning their origins and the atlas size.
@@ -353,7 +447,7 @@ fn pack_shelves_at(
 mod tests {
     use super::{
         GLASS_MARKER_SKIP, GlassMarker, GlassSkip, IRect, TILE, assign_phases,
-        assign_phases_fitting, pack_shelves,
+        assign_phases_fitting, backdrop_fills, fold_phases_fitting, pack_shelves,
     };
     use crate::{DrawTag, Encoding, Transform};
 
@@ -379,6 +473,20 @@ mod tests {
             })
             .collect();
         assign_phases(&snapped).0
+    }
+
+    /// `n` snapped markers in a diagonal row, each composite meeting only the next region.
+    fn chain(n: i32) -> Vec<GlassMarker> {
+        (0..n)
+            .map(|i| {
+                let o = 64 * i;
+                m(
+                    (64 + o, 64 + o, 192 + o, 192 + o),
+                    (96 + o, 96 + o, 160 + o, 160 + o),
+                )
+                .snap()
+            })
+            .collect()
     }
 
     fn glass_words(encoding: &Encoding, index: usize) -> [u32; 3] {
@@ -456,6 +564,66 @@ mod tests {
         assert_eq!(phases, [1, 0, 1]);
         assert_eq!(capped, 0);
         assert_eq!(tried, [(0, 1), (1, 2), (2, 1)]);
+    }
+
+    #[test]
+    fn eight_marker_chain_folds_the_last_four() {
+        let markers = chain(8);
+        let folded = fold_phases_fitting(&markers, |_, _| true);
+        assert_eq!(folded.phases, [1, 2, 3, 4, 4, 4, 4, 4]);
+        assert_eq!(folded.folded, 4);
+    }
+
+    #[test]
+    fn a_rejected_marker_still_raises_nothing_when_folding() {
+        let a = m((0, 0, 64, 64), (16, 16, 48, 48));
+        let b = m((32, 32, 96, 96), (48, 48, 80, 80));
+        let c = m((64, 64, 128, 128), (80, 80, 112, 112));
+        let snapped: Vec<_> = [a, b, c].iter().map(|m| m.snap()).collect();
+        // b is rejected, so c, which meets only b's composite, takes phase 1.
+        let folded = fold_phases_fitting(&snapped, |i, _| i != 1);
+        assert_eq!(folded.phases, [1, 0, 1]);
+        assert_eq!(folded.folded, 0);
+    }
+
+    #[test]
+    fn fills_cover_each_same_phase_composite_in_a_folded_region() {
+        let markers = chain(6);
+        let phases = fold_phases_fitting(&markers, |_, _| true).phases;
+        let fills = backdrop_fills(&markers, &phases);
+        assert_eq!(
+            fills.iter().map(|f| (f.from, f.to)).collect::<Vec<_>>(),
+            [(3, 4), (4, 5)]
+        );
+        for f in &fills {
+            assert_eq!(f.phase, 4);
+            assert_eq!(
+                f.rect,
+                markers[f.from].composite.intersect(&markers[f.to].region)
+            );
+            assert!(!f.rect.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_folded_marker_rejected_by_fits_raises_nothing() {
+        let folded = fold_phases_fitting(&chain(6), |i, _| i != 4);
+        // Marker 4 would fold but is rejected, so marker 5, which meets only its composite,
+        // takes phase 1.
+        assert_eq!(folded.phases, [1, 2, 3, 4, 0, 1]);
+        assert_eq!(folded.folded, 0);
+    }
+
+    #[test]
+    fn unfolded_frames_need_no_fill() {
+        let markers = chain(4);
+        let phases = fold_phases_fitting(&markers, |_, _| true).phases;
+        assert!(backdrop_fills(&markers, &phases).is_empty());
+    }
+
+    #[test]
+    fn assign_phases_is_unchanged() {
+        assert_eq!(assign_phases(&chain(5)), (vec![1, 2, 3, 4, 0], 1));
     }
 
     #[test]

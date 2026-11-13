@@ -12,8 +12,6 @@ pub use vello_encoding::{
 use crate::render::{glass_record_words, glass_state_size};
 #[cfg(feature = "wgpu")]
 use crate::wgpu_engine::pooled_size;
-#[cfg(feature = "wgpu")]
-use vello_encoding::assign_phases_fitting;
 
 #[cfg(feature = "wgpu")]
 use wgpu::{CommandEncoder, Device, Queue, Texture};
@@ -37,12 +35,11 @@ pub struct MarkerPlacement {
 
 /// Why a frame leaves out a marker that has pixels on the target.
 ///
-/// Only the renderer's logs report it (`glass.phase.capped`, `glass.state.full`).
+/// Only the renderer's `glass.state.full` log reports it. A marker past
+/// [`MAX_GLASS_PHASES`] isn't left out: it folds into the last phase.
 #[cfg(feature = "wgpu")]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum GlassLeftOut {
-    /// The marker would need a phase past [`MAX_GLASS_PHASES`].
-    PhaseCap,
     /// The marker doesn't fit the device: its resume records would take the glass state past
     /// the storage binding limit, a list past the dispatch limit, or an atlas past the
     /// texture size limit.
@@ -128,12 +125,30 @@ pub(crate) struct GlassMarkerRow {
     pad: u32,
 }
 
+/// A [`BackdropFill`] placed in the backdrop atlas: a copy from one slot into another.
+#[cfg(feature = "wgpu")]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PlacedFill {
+    /// The phase whose glass passes read the filled slot; the copy precedes them.
+    pub(crate) phase: u32,
+    /// Top-left texel read, in the earlier marker's slot.
+    pub(crate) from: (u32, u32),
+    /// Top-left texel written, in the folded marker's slot.
+    pub(crate) to: (u32, u32),
+    /// Width and height of the copy, in texels.
+    pub(crate) size: (u32, u32),
+}
+
 /// A frame's glass layout: placements, the marker table and atlas sizes.
 #[cfg(feature = "wgpu")]
 #[derive(Debug, Default)]
 pub(crate) struct GlassPlan {
     /// Placed markers, ordered by phase and then paint order.
     pub(crate) placements: Vec<MarkerPlacement>,
+    /// Backdrop copies for folded markers, in the order they must run.
+    pub(crate) fills: Vec<PlacedFill>,
+    /// Kept markers folded into the last phase.
+    pub(crate) folded: usize,
     /// One row per encoded marker, indexed by the marker index in the draw data.
     pub(crate) rows: Vec<GlassMarkerRow>,
     pub(crate) phases: u32,
@@ -229,10 +244,11 @@ const MIN_ATLAS_WIDTH: u32 = 512;
 /// Lays out a frame's glass for a `width`×`height` target within `limits`.
 ///
 /// Markers under more than [`MAX_GLASS_LAYERS`] open layers, with no pixels on the
-/// target, past the phase cap, past the glass state's limits or whose slots would take an
-/// atlas past the texture size limit are left out: their rows have phase 0 and they get no
-/// placement. Both atlas sizes the plan returns fit in `limits.texture_side`. Markers are kept in paint order while they fit;
-/// one that doesn't is left out and later ones are still tried.
+/// target, past the glass state's limits or whose slots would take an atlas past the
+/// texture size limit are left out: their rows have phase 0 and they get no placement.
+/// Both atlas sizes the plan returns fit in `limits.texture_side`. Markers are kept in
+/// paint order while they fit; one that doesn't is left out and later ones are still tried.
+/// Markers past the phase cap fold into the last phase, with the backdrop fills they need.
 #[cfg(feature = "wgpu")]
 pub(crate) fn plan(
     markers: &GlassMarkers,
@@ -298,7 +314,7 @@ pub(crate) fn plan(
         let (_, (w, h)) = pack_shelves(sizes, MIN_ATLAS_WIDTH, limits.texture_side);
         w <= limits.texture_side && h <= limits.texture_side
     };
-    let (phases, capped) = assign_phases_fitting(&clamped, |j, phase| {
+    let FoldedPhases { phases, folded } = fold_phases_fitting(&clamped, |j, phase| {
         let p = phase as usize - 1;
         let regions = region_tiles + u64::from(tile_count(clamped[j].region));
         let list = regions.min(u64::from(target_tiles)) as u32;
@@ -326,18 +342,28 @@ pub(crate) fn plan(
         }
         fits
     });
-    if capped > 0 {
-        log::warn!("glass.phase.capped markers={capped} max={MAX_GLASS_PHASES}");
-    }
     for (j, &phase) in phases.iter().enumerate() {
         if phase == 0 {
-            left_out[included[j]] = Some(if state_full[j] {
-                GlassLeftOut::StateFull
-            } else {
-                GlassLeftOut::PhaseCap
-            });
+            debug_assert!(state_full[j], "only the state's limits leave a marker out");
+            left_out[included[j]] = Some(GlassLeftOut::StateFull);
         }
     }
+    let fills = backdrop_fills(&clamped, &phases);
+    // Each included marker's index among the kept ones, whose slots are packed in order.
+    let mut slot = Vec::with_capacity(phases.len());
+    let mut kept_count = 0;
+    for &phase in &phases {
+        slot.push(kept_count);
+        kept_count += usize::from(phase != 0);
+    }
+    // A backdrop slot starts at its region's tile-snapped corner.
+    let corners: Vec<_> = clamped
+        .iter()
+        .map(|m| {
+            let r = m.region.snap_out(TILE);
+            (r.x0, r.y0)
+        })
+        .collect();
     // (encoded index, clamped marker, phase) of each marker the frame places.
     let kept: Vec<_> = included
         .into_iter()
@@ -350,6 +376,23 @@ pub(crate) fn plan(
         pack_shelves(&backdrop_sizes, MIN_ATLAS_WIDTH, limits.texture_side);
     let (glass_origins, glass_size) =
         pack_shelves(&glass_sizes, MIN_ATLAS_WIDTH, limits.texture_side);
+    // The texel of pixel `(x, y)` in included marker `j`'s backdrop slot.
+    let texel = |j: usize, x: i32, y: i32| {
+        let ((ox, oy), (cx, cy)) = (backdrop_origins[slot[j]], corners[j]);
+        (ox + (x - cx) as u32, oy + (y - cy) as u32)
+    };
+    let fills = fills
+        .iter()
+        .map(|f| PlacedFill {
+            phase: f.phase,
+            from: texel(f.from, f.rect.x0, f.rect.y0),
+            to: texel(f.to, f.rect.x0, f.rect.y0),
+            size: (
+                (f.rect.x1 - f.rect.x0) as u32,
+                (f.rect.y1 - f.rect.y0) as u32,
+            ),
+        })
+        .collect();
     let pack = |(x, y): (u32, u32)| x | y << 16;
     let mut rows = vec![GlassMarkerRow::default(); markers.len()];
     let mut placements = Vec::with_capacity(kept.len());
@@ -381,6 +424,8 @@ pub(crate) fn plan(
     GlassPlan {
         phases: placements.last().map_or(0, |p| p.phase),
         placements,
+        fills,
+        folded,
         rows,
         backdrop_size,
         glass_size,
@@ -462,7 +507,7 @@ impl AtlasSizer {
 mod tests {
     use super::{
         AtlasSizer, GlassLeftOut, GlassLimits, GlassMarker, GlassMarkers, GlassPlan, IRect,
-        phase_placements,
+        PlacedFill, phase_placements,
     };
     use crate::render::glass_state_size;
 
@@ -533,7 +578,7 @@ mod tests {
     }
 
     #[test]
-    fn markers_past_the_phase_cap_get_phase_zero_rows() {
+    fn markers_past_the_phase_cap_fold_into_the_last_phase() {
         let chain: Vec<_> = (0..5)
             .map(|i| {
                 let o = 64 * i;
@@ -543,10 +588,24 @@ mod tests {
             .collect();
         let plan = plan(&markers(&chain), 512, 512);
         let ids: Vec<_> = plan.placements.iter().map(|p| (p.id, p.phase)).collect();
-        assert_eq!(ids, [(0, 1), (1, 2), (2, 3), (3, 4)]);
+        assert_eq!(ids, [(0, 1), (1, 2), (2, 3), (3, 4), (4, 4)]);
         assert_eq!(plan.phases, 4);
-        assert_eq!(plan.rows[4], super::GlassMarkerRow::default());
-        assert_eq!(plan.capacities, [16; 4]);
+        assert_eq!(plan.folded, 1);
+        assert_eq!(plan.rows[4].phase, 4);
+        assert_eq!(plan.capacities, [16, 16, 16, 32]);
+        // Marker 3's composite, (288, 288) to (352, 352), meets marker 4's region from
+        // (320, 320): 64 px into marker 3's slot and at the start of marker 4's.
+        let (m3, m4) = (plan.placements[3], plan.placements[4]);
+        let at = |(x, y): (u32, u32), dx: u32| (x + dx, y + dx);
+        assert_eq!(
+            plan.fills,
+            [PlacedFill {
+                phase: 4,
+                from: at(m3.backdrop_origin, 64),
+                to: m4.backdrop_origin,
+                size: (32, 32),
+            }]
+        );
     }
 
     #[test]
@@ -673,8 +732,8 @@ mod tests {
 
     #[test]
     fn list_capacity_counts_only_kept_markers() {
-        // The too-deep and capped markers get the skip bit, so coarse lists none of their
-        // tiles, whatever depth it sees in each tile.
+        // The too-deep marker gets the skip bit, so coarse lists none of its tiles, whatever
+        // depth it sees in each tile; the folded fifth marker is kept.
         let chain: Vec<_> = (0..5)
             .map(|i| {
                 let o = 64 * i;
@@ -684,10 +743,11 @@ mod tests {
             .chain([(9, r(0, 448, 64, 512), r(0, 448, 16, 464), 9)])
             .collect();
         let plan = plan(&markers(&chain), 512, 512);
-        assert_eq!(plan.list_capacity, 4 * 64);
-        assert_eq!(plan.left_out[4], Some(GlassLeftOut::PhaseCap));
+        assert_eq!(plan.list_capacity, 5 * 64);
+        assert_eq!(plan.left_out[4], None);
+        assert_eq!(plan.fills.len(), 1);
         assert_eq!(plan.left_out[5], None);
-        assert_eq!(plan.left_out_offsets, [12, 15]);
+        assert_eq!(plan.left_out_offsets, [15]);
     }
 
     #[test]

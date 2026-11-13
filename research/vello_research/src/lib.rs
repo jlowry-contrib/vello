@@ -348,6 +348,11 @@ pub struct Renderer {
     glass_atlas_format: GlassAtlasFormat,
     /// Markers the glass state's limits left out of the last glass frame, logged on change.
     glass_state_full: usize,
+    /// Markers the last glass frame folded into the last phase, logged on change.
+    glass_folded: usize,
+    /// Scratch for backdrop fills, as WebGPU can't copy within one texture.
+    glass_fill_scratch: Option<(wgpu::Texture, TextureView)>,
+    glass_fill_scratch_sizer: glass::AtlasSizer,
     glass_stops_disabled: bool,
     glass_permutation_forced: bool,
     glass_start_pass_disabled: bool,
@@ -457,6 +462,25 @@ fn fit_glass_atlas(
     format: recording::ImageFormat,
     size: (u32, u32),
 ) -> Result<recording::ImageProxy> {
+    // Hooks and tests copy into and out of the atlases.
+    let usage = wgpu::TextureUsages::STORAGE_BINDING
+        | wgpu::TextureUsages::TEXTURE_BINDING
+        | wgpu::TextureUsages::COPY_SRC
+        | wgpu::TextureUsages::COPY_DST;
+    fit_glass_texture(atlas, sizer, device, label, format, usage, size)
+}
+
+/// Sizes a texture kept across glass frames as [`fit_glass_atlas`] does, with `usage`.
+#[cfg(feature = "wgpu")]
+fn fit_glass_texture(
+    atlas: &mut Option<(wgpu::Texture, TextureView)>,
+    sizer: &mut glass::AtlasSizer,
+    device: &Device,
+    label: &'static str,
+    format: recording::ImageFormat,
+    usage: wgpu::TextureUsages,
+    size: (u32, u32),
+) -> Result<recording::ImageProxy> {
     let wgpu_format = format.to_wgpu();
     let current = atlas
         .as_ref()
@@ -485,11 +509,7 @@ fn fit_glass_atlas(
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu_format,
-            // Hooks and tests copy into and out of the atlases.
-            usage: wgpu::TextureUsages::STORAGE_BINDING
-                | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_SRC
-                | wgpu::TextureUsages::COPY_DST,
+            usage,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -548,6 +568,9 @@ impl Renderer {
             glass_resume_format: GlassResumeFormat::default(),
             glass_atlas_format: GlassAtlasFormat::default(),
             glass_state_full: 0,
+            glass_folded: 0,
+            glass_fill_scratch: None,
+            glass_fill_scratch_sizer: glass::AtlasSizer::default(),
             glass_stops_disabled: false,
             glass_permutation_forced: false,
             glass_start_pass_disabled: false,
@@ -681,6 +704,15 @@ impl Renderer {
                 );
             }
         }
+        if plan.folded != self.glass_folded {
+            self.glass_folded = plan.folded;
+            let (folded, max) = (plan.folded, glass::MAX_GLASS_PHASES);
+            if folded > 0 {
+                log::warn!("glass.phase.folded markers={folded} max={max}");
+            } else {
+                log::info!("glass.phase.folded markers=0 max={max}");
+            }
+        }
         if let (Some(list), _) = self.glass_capacity_for_tests {
             plan.list_capacity = plan.list_capacity.min(list);
         }
@@ -728,6 +760,20 @@ impl Renderer {
             glass_format,
             plan.glass_size,
         )?;
+        let fill_size = plan.fills.iter().fold((0, 0), |(w, h), f| {
+            (u32::max(w, f.size.0), u32::max(h, f.size.1))
+        });
+        if !plan.fills.is_empty() {
+            fit_glass_texture(
+                &mut self.glass_fill_scratch,
+                &mut self.glass_fill_scratch_sizer,
+                device,
+                "vello.glass_fill_scratch",
+                recording::ImageFormat::Rgba8,
+                wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+                fill_size,
+            )?;
+        }
         passes.prepare(
             device,
             queue,
@@ -773,6 +819,8 @@ impl Renderer {
             backdrop,
             glass: glass_atlas,
             placements: &plan.placements,
+            fills: &plan.fills,
+            fill_scratch: self.glass_fill_scratch.as_ref().map(|(texture, _)| texture),
         };
         self.engine.run_recording(
             device,

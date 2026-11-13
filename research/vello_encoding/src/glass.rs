@@ -5,7 +5,7 @@
 
 use crate::Transform;
 
-/// The most glass phases a frame renders; deeper markers are left out.
+/// The most glass phases a frame renders; deeper markers fold into the last one.
 // The glass design's phase cap: it bounds the number of fine dispatches per frame.
 pub const MAX_GLASS_PHASES: u32 = 4;
 

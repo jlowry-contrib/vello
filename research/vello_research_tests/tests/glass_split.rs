@@ -947,46 +947,190 @@ impl GlassPasses for GlassOnEveryMarker {
     }
 }
 
+/// Returns placement `id` from the markers `prepare` saw.
+fn placement(capture: &CaptureBackdrop, id: u32) -> MarkerPlacement {
+    *capture
+        .frame
+        .iter()
+        .find(|p| p.id == id)
+        .unwrap_or_else(|| panic!("marker {id} was not placed"))
+}
+
+/// Returns placement `p`'s backdrop slot texel for target pixel `(x, y)`.
+fn slot_pixel(atlas: &Atlas, p: &MarkerPlacement, x: i32, y: i32) -> [u8; 4] {
+    atlas.pixel(
+        p.backdrop_origin.0 + (x - p.region.x0) as u32,
+        p.backdrop_origin.1 + (y - p.region.y0) as u32,
+    )
+}
+
+fn contains(r: IRect, x: i32, y: i32) -> bool {
+    x >= r.x0 && x < r.x1 && y >= r.y0 && y < r.y1
+}
+
+/// The background, then a five-marker chain when `marked`.
+fn chain_of_five(scene: &mut Scene, marked: bool) {
+    background(scene);
+    if marked {
+        push_chain(scene, 5);
+    }
+}
+
 #[test]
 #[cfg_attr(skip_gpu_tests, ignore)]
-fn marker_past_the_phase_cap_draws_nothing() {
-    // Each composite meets the next region, so the fifth marker would need phase 5.
-    let chain = |count: i32| {
-        move |scene: &mut Scene, marked: bool| {
-            background(scene);
-            if marked {
-                for i in 0..count {
-                    let o = 64 * i;
-                    let region = rect(64 + o, 64 + o, 192 + o, 192 + o);
-                    let composite = rect(96 + o, 96 + o, 160 + o, 160 + o);
-                    marker_with_id(scene, i as u32, region, composite);
-                }
+fn folded_marker_reads_its_neighbour_s_backdrop() {
+    let mut capture = CaptureBackdrop::default();
+    outputs(
+        AaConfig::Area,
+        GlassResumeFormat::F32,
+        |_| {},
+        chain_of_five,
+        &mut capture,
+    );
+    let phases: Vec<_> = capture.frame.iter().map(|p| (p.id, p.phase)).collect();
+    assert_eq!(phases, [(0, 1), (1, 2), (2, 3), (3, 4), (4, 4)]);
+    assert_eq!(capture.phases, [1, 2, 3, 4]);
+    let (m3, m4) = (placement(&capture, 3), placement(&capture, 4));
+    for p in capture.frame.iter().filter(|p| p.id < 3) {
+        assert!(
+            !p.composite.intersects(&m4.region),
+            "marker {} meets marker 4's region",
+            p.id
+        );
+    }
+    let fill = intersect(m3.composite, m4.region);
+    assert!(!fill.is_empty(), "the test markers overlap");
+    let mut scene = Scene::new();
+    background(&mut scene);
+    let backdrop = render_scene(512, 512, AaConfig::Area, &scene);
+    let atlas = capture.backdrop();
+    let mut worst = 0;
+    for y in m4.region.y0..m4.region.y1 {
+        for x in m4.region.x0..m4.region.x1 {
+            let got = slot_pixel(&atlas, &m4, x, y);
+            if contains(fill, x, y) {
+                let want = slot_pixel(&atlas, &m3, x, y);
+                assert_eq!(got, want, "({x}, {y}) differs from marker 3's slot");
+            } else {
+                let i = ((y as u32 * 512 + x as u32) * 4) as usize;
+                let delta = max_delta(&got, &backdrop[i..i + 4]);
+                worst = worst.max(delta);
+                assert!(
+                    delta <= 1,
+                    "({x}, {y}) differs from the background by {delta}"
+                );
             }
         }
-    };
-    let render = |count: i32| {
-        let mut passes = GlassOnEveryMarker::default();
-        let (_, split) = outputs(
-            AaConfig::Area,
-            GlassResumeFormat::F32,
-            |_| {},
-            chain(count),
-            &mut passes,
-        );
-        (split, passes.capture)
-    };
-    let (four, four_capture) = render(4);
-    let (five, five_capture) = render(5);
-    let phases = |c: &CaptureBackdrop| c.frame.iter().map(|p| (p.id, p.phase)).collect::<Vec<_>>();
-    assert_eq!(phases(&four_capture), [(0, 1), (1, 2), (2, 3), (3, 4)]);
-    assert_eq!(phases(&five_capture), phases(&four_capture));
-    assert_eq!(five_capture.frame, four_capture.frame);
-    assert_eq!(five_capture.phases, [1, 2, 3, 4]);
-    assert_eq!(
-        max_delta(&four, &five),
-        0,
-        "the capped marker changed the output"
+    }
+    eprintln!("glass.fold.backdrop max_delta={worst}");
+}
+
+#[test]
+#[cfg_attr(skip_gpu_tests, ignore)]
+fn folded_marker_composites_its_glass() {
+    let mut passes = GlassOnEveryMarker::default();
+    let (unsplit, split) = outputs(
+        AaConfig::Area,
+        GlassResumeFormat::F32,
+        |_| {},
+        chain_of_five,
+        &mut passes,
     );
+    let (m3, m4) = (placement(&passes.capture, 3), placement(&passes.capture, 4));
+    assert_eq!(m4.phase, 4);
+    let mut pixels = 0;
+    for y in m4.composite.y0..m4.composite.y1 {
+        for x in m4.composite.x0..m4.composite.x1 {
+            if contains(m3.composite, x, y) {
+                continue;
+            }
+            pixels += 1;
+            let i = ((y as u32 * 512 + x as u32) * 4) as usize;
+            for c in 0..4 {
+                let b = f64::from(unsplit[i + c]) / 255.0;
+                let want = (f64::from(GLASS[c]) + (1.0 - f64::from(GLASS[3])) * b) * 255.0;
+                let got = f64::from(split[i + c]);
+                assert!(
+                    (got - want).abs() <= 1.0,
+                    "({x}, {y}) channel {c}: got {got}, want {want:.2}"
+                );
+            }
+        }
+    }
+    assert!(pixels > 0, "marker 4's composite lies inside marker 3's");
+}
+
+const RED: [u8; 4] = [255, 0, 0, 255];
+const BLUE: [u8; 4] = [0, 0, 255, 255];
+
+/// Renders a frame of `build`'s scene over solid `rgba` with `renderer`, capturing backdrops.
+fn solid_frame(
+    renderer: &mut Renderer,
+    rgba: [u8; 4],
+    build: impl Fn(&mut Scene),
+) -> CaptureBackdrop {
+    let mut scene = Scene::new();
+    fill(&mut scene, rgba, &Rect::new(0.0, 0.0, 512.0, 512.0));
+    build(&mut scene);
+    let mut capture = CaptureBackdrop::default();
+    render_frame(
+        renderer,
+        512,
+        512,
+        AaConfig::Area,
+        &scene,
+        Some(&mut capture),
+    );
+    capture
+}
+
+/// Renders `build` over red, then over blue with the same renderer, and checks marker 4's
+/// slot in the blue frame: blue over its region, and marker 3's slot over the fill.
+fn assert_no_stale_fold(build: impl Fn(&mut Scene) + Copy) {
+    let mut renderer = gpu_renderer(AaSupport::area_only());
+    let red = solid_frame(&mut renderer, RED, build);
+    let blue = solid_frame(&mut renderer, BLUE, build);
+    assert_eq!(placement(&red, 4), placement(&blue, 4), "the slots moved");
+    let (m3, m4) = (placement(&blue, 3), placement(&blue, 4));
+    assert_eq!(m4.phase, 4, "marker 4 folds into phase 4");
+    let fill = intersect(m3.composite, m4.region);
+    let atlas = blue.backdrop();
+    for y in m4.region.y0..m4.region.y1 {
+        for x in m4.region.x0..m4.region.x1 {
+            let got = slot_pixel(&atlas, &m4, x, y);
+            assert_ne!(got, RED, "({x}, {y}) holds the previous frame");
+            assert_eq!(got, BLUE, "({x}, {y})");
+            if contains(fill, x, y) {
+                assert_eq!(got, slot_pixel(&atlas, &m3, x, y), "({x}, {y})");
+            }
+        }
+    }
+}
+
+#[test]
+#[cfg_attr(skip_gpu_tests, ignore)]
+fn folded_backdrop_never_reads_the_previous_frame() {
+    assert_no_stale_fold(|scene| push_chain(scene, 5));
+}
+
+#[test]
+#[cfg_attr(skip_gpu_tests, ignore)]
+fn fill_under_a_clipped_neighbour_reads_no_stale_pixels() {
+    // Marker 3's composite spans rows 288 to 352; the clip keeps its tiles above row 336, so
+    // the fill's last tile row, 336 to 352, has no stop for marker 3.
+    assert_no_stale_fold(|scene| {
+        push_chain(scene, 3);
+        scene.push_clip_layer(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            &Rect::new(0.0, 0.0, 512.0, 336.0),
+        );
+        let (region, composite) = chain_marker(3);
+        marker_with_id(scene, 3, region, composite);
+        scene.pop_layer();
+        let (region, composite) = chain_marker(4);
+        marker_with_id(scene, 4, region, composite);
+    });
 }
 
 #[test]
@@ -1376,38 +1520,43 @@ fn lite_pass_renders_no_command_of_a_flagged_tile() {
     }
 }
 
-/// The four-marker chain of `marker_past_the_phase_cap_draws_nothing`, plus a fifth marker
-/// past the phase cap when `capped`.
-fn chain(capped: bool) -> Scene {
+/// Marker `i` of a chain: each composite meets the next marker's region, so marker `i` would
+/// need phase `i + 1`.
+fn chain_marker(i: u32) -> (IRect, IRect) {
+    let o = 64 * i as i32;
+    (
+        rect(64 + o, 64 + o, 192 + o, 192 + o),
+        rect(96 + o, 96 + o, 160 + o, 160 + o),
+    )
+}
+
+/// Pushes the first `count` markers of the chain.
+fn push_chain(scene: &mut Scene, count: u32) {
+    for i in 0..count {
+        let (region, composite) = chain_marker(i);
+        marker_with_id(scene, i, region, composite);
+    }
+}
+
+/// The background, then `count` chained markers; those past the fourth fold into phase 4.
+fn chain(count: u32) -> Scene {
     let mut scene = Scene::new();
     background(&mut scene);
-    for i in 0..if capped { 5 } else { 4 } {
-        let o = 64 * i;
-        let region = rect(64 + o, 64 + o, 192 + o, 192 + o);
-        let composite = rect(96 + o, 96 + o, 160 + o, 160 + o);
-        marker_with_id(&mut scene, i as u32, region, composite);
-    }
+    push_chain(&mut scene, count);
     scene
 }
 
 #[test]
 #[cfg_attr(skip_gpu_tests, ignore)]
-fn capped_marker_emits_no_glass_commands() {
-    let header = |capped: bool| {
-        let mut renderer = gpu_renderer(AaSupport::area_only());
-        frame(&mut renderer, &chain(capped), true);
-        glass_state_words(&renderer)[..8].to_vec()
-    };
-    let (four, five) = (header(false), header(true));
-    // The fifth region reaches tiles no other region covers, so any glass command coarse
-    // wrote for the capped marker would add them to list 0, word 1.
-    assert_eq!(
-        five, four,
-        "the capped marker changed the glass state header"
-    );
-    // Four phases ran and each stopped its 16 composite tiles; nothing overflowed.
-    assert_eq!(five[0], 4);
-    assert_eq!(five[2..], [0, 0, 16, 16, 16, 16]);
+fn folded_marker_stops_in_phase_four() {
+    let mut renderer = gpu_renderer(AaSupport::area_only());
+    frame(&mut renderer, &chain(5), true);
+    let header = glass_state_words(&renderer)[..8].to_vec();
+    // Four phases ran; phase 4 stopped the 16 composite tiles of each of its two markers,
+    // and nothing overflowed.
+    assert_eq!(header[0], 4);
+    assert_eq!(header[2], 0, "the overflow word");
+    assert_eq!(header[4..], [16, 16, 16, 32]);
 }
 
 #[test]

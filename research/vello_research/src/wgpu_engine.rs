@@ -14,7 +14,7 @@ use wgpu::{
 
 use crate::{
     Error, Result,
-    glass::{GlassPasses, GlassPhase, MarkerPlacement, phase_placements},
+    glass::{GlassPasses, GlassPhase, MarkerPlacement, PlacedFill, phase_placements},
     low_level::{BufferProxy, Command, ImageProxy, Recording, ResourceId, ResourceProxy, ShaderId},
     recording::BindType,
 };
@@ -100,6 +100,20 @@ pub(crate) struct ExternalPasses<'a> {
     pub(crate) glass: &'a Texture,
     /// Placed markers, ordered by phase.
     pub(crate) placements: &'a [MarkerPlacement],
+    /// Backdrop copies for folded markers, in the order they run.
+    pub(crate) fills: &'a [PlacedFill],
+    /// Holds each fill between its two copies; `Some` when there are fills.
+    pub(crate) fill_scratch: Option<&'a Texture>,
+}
+
+/// Returns the copy location of texel `(x, y)` in `texture`'s first mip level.
+fn texel_copy(texture: &Texture, (x, y): (u32, u32)) -> wgpu::TexelCopyTextureInfo<'_> {
+    wgpu::TexelCopyTextureInfo {
+        texture,
+        mip_level: 0,
+        origin: wgpu::Origin3d { x, y, z: 0 },
+        aspect: TextureAspect::All,
+    }
 }
 
 /// A buffer can exist either on the GPU or on CPU.
@@ -777,6 +791,29 @@ impl WgpuEngine {
                     let external = external
                         .as_deref_mut()
                         .expect("a recording with external commands needs external passes");
+                    // Folded markers' backdrops, in order, as a fill may read an earlier
+                    // fill's destination. The copies go through the scratch texture because
+                    // a copy within one texture subresource is invalid.
+                    for fill in external.fills.iter().filter(|f| f.phase == *index) {
+                        let scratch = external
+                            .fill_scratch
+                            .expect("a frame with backdrop fills has a fill scratch texture");
+                        let size = wgpu::Extent3d {
+                            width: fill.size.0,
+                            height: fill.size.1,
+                            depth_or_array_layers: 1,
+                        };
+                        encoder.copy_texture_to_texture(
+                            texel_copy(external.backdrop, fill.from),
+                            texel_copy(scratch, (0, 0)),
+                            size,
+                        );
+                        encoder.copy_texture_to_texture(
+                            texel_copy(scratch, (0, 0)),
+                            texel_copy(external.backdrop, fill.to),
+                            size,
+                        );
+                    }
                     external.passes.record(
                         device,
                         &mut encoder,

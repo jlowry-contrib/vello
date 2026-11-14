@@ -162,6 +162,8 @@ pub struct Resolver {
     image_cache: ImageCache,
     pending_images: Vec<PendingImage>,
     patches: Vec<ResolvedPatch>,
+    /// Whether the last [`Resolver::resolve`] pass resolved patches, and so used the image cache.
+    resolved_patches: bool,
 }
 
 impl Resolver {
@@ -178,6 +180,22 @@ impl Resolver {
         self.image_cache.mark_dirty(image);
     }
 
+    /// Re-queues the resident images after the renderer replaced its image atlas texture.
+    ///
+    /// The cache keeps each image's atlas location across passes and uploads only new or
+    /// dirty images, so a new texture would otherwise lack the images already resident.
+    /// Every resident image is marked dirty. After a pass that resolved patches, the returned
+    /// uploads also include the images that pass used, at their existing locations; after a
+    /// pass without patches, which reports no atlas, nothing is returned.
+    pub fn image_atlas_replaced(&mut self) -> Images<'_> {
+        self.image_cache.atlas_replaced(self.resolved_patches);
+        if self.resolved_patches {
+            self.image_cache.images()
+        } else {
+            Images::default()
+        }
+    }
+
     /// Resolves late bound resources and packs an encoding. Returns the packed
     /// layout and computed ramp data.
     pub fn resolve<'a>(
@@ -186,7 +204,8 @@ impl Resolver {
         packed: &mut Vec<u8>,
     ) -> (Layout, Ramps<'a>, Images<'a>) {
         let resources = &encoding.resources;
-        if resources.patches.is_empty() {
+        self.resolved_patches = !resources.patches.is_empty();
+        if !self.resolved_patches {
             let layout = resolve_solid_paths_only(encoding, packed);
             return (layout, Ramps::default(), Images::default());
         }

@@ -317,7 +317,7 @@ impl Render {
         let mut recording = Recording::default();
         let mut packed = vec![];
 
-        let (layout, ramps, images) = resolver.resolve(encoding, &mut packed);
+        let (layout, ramps, mut images) = resolver.resolve(encoding, &mut packed);
         if let Some(glass) = glass {
             skip_glass_markers(&mut packed, layout.draw_data_base, glass.left_out);
         }
@@ -334,6 +334,7 @@ impl Render {
         };
         let atlas_width = images.width.max(1);
         let atlas_height = images.height.max(1);
+        let evicted = images.evicted;
         let (image_atlas, atlas_proxy_action) = match persistent_image_atlas {
             Some(proxy) if proxy.width == atlas_width && proxy.height == atlas_height => {
                 (*proxy, AtlasProxyAction::Reused)
@@ -350,11 +351,15 @@ impl Render {
                 (proxy, AtlasProxyAction::Created)
             }
         };
+        if !matches!(atlas_proxy_action, AtlasProxyAction::Reused) {
+            // The new texture is empty, while the resolver still holds its images as resident.
+            images = resolver.image_atlas_replaced();
+        }
         if !matches!(atlas_proxy_action, AtlasProxyAction::Reused)
             || !images.images.is_empty()
-            || images.evicted != 0
+            || evicted != 0
         {
-            if images.evicted == 0 {
+            if evicted == 0 {
                 log::debug!(
                     "image atlas {}x{}: {:?}, {} upload(s)",
                     atlas_width,
@@ -369,7 +374,7 @@ impl Render {
                     atlas_height,
                     atlas_proxy_action,
                     images.images.len(),
-                    images.evicted
+                    evicted
                 );
             }
         }

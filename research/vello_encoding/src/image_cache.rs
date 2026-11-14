@@ -159,6 +159,25 @@ impl ImageCache {
         }
     }
 
+    /// Re-queues resident images after the renderer replaced the atlas texture.
+    ///
+    /// The new texture holds none of them. With `requeue_used`, images used in the current
+    /// resolve pass are queued for upload at their existing locations; every other resident
+    /// is marked dirty, so it uploads when next used.
+    pub(crate) fn atlas_replaced(&mut self, requeue_used: bool) {
+        for resident in self.map.values_mut() {
+            if requeue_used && resident.last_used_generation == self.generation {
+                let id = resident.image.data.id();
+                if !self.images.iter().any(|(image, ..)| image.data.id() == id) {
+                    self.images
+                        .push((resident.image.clone(), resident.x, resident.y));
+                }
+            } else {
+                resident.dirty = true;
+            }
+        }
+    }
+
     pub(crate) fn can_fit_image(&self, image: &ImageData) -> bool {
         image.width <= self.atlas.size().width as u32
             && image.height <= self.atlas.size().height as u32
@@ -287,6 +306,50 @@ mod tests {
 
         cache.begin_resolve();
         assert_eq!(cache.get_or_insert(&image), Some(xy));
+        assert_eq!(cache.images.len(), 1);
+    }
+
+    #[test]
+    fn a_replaced_atlas_requeues_the_images_used_this_pass() {
+        let mut cache = ImageCache::new_with_sizes(32, 64);
+        let used = image(1, 8, 8);
+        let unused = image(2, 8, 8);
+
+        cache.begin_resolve();
+        cache.get_or_insert(&used).unwrap();
+        cache.get_or_insert(&unused).unwrap();
+        cache.finish_resolve();
+
+        cache.begin_resolve();
+        let xy = cache.get_or_insert(&used).unwrap();
+        cache.finish_resolve();
+        assert!(cache.images.is_empty());
+
+        cache.atlas_replaced(true);
+        assert_eq!(cache.images.len(), 1);
+        assert_eq!(cache.images[0].0.data.id(), used.data.id());
+        assert_eq!((cache.images[0].1, cache.images[0].2), xy);
+
+        cache.begin_resolve();
+        cache.get_or_insert(&unused).unwrap();
+        assert_eq!(cache.images.len(), 1);
+        assert_eq!(cache.images[0].0.data.id(), unused.data.id());
+    }
+
+    #[test]
+    fn a_replaced_atlas_marks_every_resident_dirty_after_a_pass_without_patches() {
+        let mut cache = ImageCache::new_with_sizes(32, 64);
+        let image = image(1, 8, 8);
+
+        cache.begin_resolve();
+        cache.get_or_insert(&image).unwrap();
+        cache.finish_resolve();
+
+        cache.atlas_replaced(false);
+        assert!(cache.map.values().all(|resident| resident.dirty));
+
+        cache.begin_resolve();
+        cache.get_or_insert(&image).unwrap();
         assert_eq!(cache.images.len(), 1);
     }
 

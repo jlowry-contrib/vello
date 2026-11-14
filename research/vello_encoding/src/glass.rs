@@ -352,11 +352,12 @@ pub struct BackdropFill {
 ///
 /// On a tile of marker `to`'s region that also lies in an earlier same-phase marker `from`'s
 /// composite, fine stops at `from` and resumes only in that phase's fine pass, after its glass
-/// passes ran, so `to`'s backdrop is never snapshot there. Same-phase composites never
-/// overlap and a composite lies inside its region, so `from`'s slot holds the backdrop
-/// `from` saw on those tiles, which the renderer copies into `to`'s slot. Only markers
-/// folded by [`fold_phases_fitting`] can meet a same-phase composite, so other frames get
-/// no fills. Markers with phase 0 are skipped.
+/// passes ran, so `to`'s backdrop is never snapshot there. A tile stops at the first
+/// same-phase composite in paint order, and a composite lies inside its region, so `from`'s
+/// slot holds the backdrop `from` saw on those tiles, which the renderer copies into `to`'s
+/// slot. Folded composites may overlap; fine composites both in that phase's resume. Only
+/// markers folded by [`fold_phases_fitting`] can meet a same-phase composite, so other
+/// frames get no fills. Markers with phase 0 are skipped.
 pub fn backdrop_fills(markers: &[GlassMarker], phases: &[u32]) -> Vec<BackdropFill> {
     let mut fills = Vec::new();
     for (to, (marker, &phase)) in markers.iter().zip(phases).enumerate() {
